@@ -1,0 +1,22 @@
+name: torrent_bridge
+description: "A lightweight torrent-to-HTTP bridge that exposes torrent files through a local streaming server in android. It is made for exposing audiobooks in MeroAudiobook app."
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  libtorrent_flutter: 1.7.8
+  path_provider: ^2.1.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

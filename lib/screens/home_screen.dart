@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:libtorrent_flutter/libtorrent_flutter.dart';
@@ -6,6 +7,8 @@ import 'package:libtorrent_flutter/libtorrent_flutter.dart';
 import '../models/debrid_models.dart';
 import '../models/streaming_models.dart';
 import '../services/android_foreground_service.dart';
+import '../services/app_update_service.dart';
+import '../services/audio_disk_cache_service.dart';
 import '../services/debrid_service.dart';
 import '../services/http_streaming_server.dart';
 import '../services/server_settings_service.dart';
@@ -15,8 +18,13 @@ const String kDefaultTestInfoHash = '2a72c612335bd7cc5221b9c20838a9a349cf3821';
 
 class HomeScreen extends StatefulWidget {
   final DebridService? debridService;
+  final AppUpdateService? appUpdateService;
 
-  const HomeScreen({super.key, this.debridService});
+  const HomeScreen({
+    super.key,
+    this.debridService,
+    this.appUpdateService,
+  });
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -27,6 +35,8 @@ class _HomeScreenState extends State<HomeScreen>
   final _server = HttpStreamingServer.instance;
   final _engine = TorrentEngineService.instance;
   final _settings = ServerSettingsService.instance;
+  final _diskCache = AudioDiskCacheService.instance;
+  late final AppUpdateService _updater;
 
   final _magnetCtrl = TextEditingController(text: kDefaultTestInfoHash);
   final _filePathCtrl = TextEditingController();
@@ -37,16 +47,24 @@ class _HomeScreenState extends State<HomeScreen>
   bool _isInspectingTorrent = false;
   String? _torrentError;
   AppLifecycleState _lifecycleState = AppLifecycleState.resumed;
+  BackgroundHealthStatus? _backgroundHealth;
 
   @override
   void initState() {
     super.initState();
+    _updater = widget.appUpdateService ?? AppUpdateService.instance;
     _tabController = TabController(length: 3, vsync: this);
     WidgetsBinding.instance.addObserver(this);
     _server.addListener(_onChanged);
     _engine.addListener(_onChanged);
     _settings.addListener(_onChanged);
+    _diskCache.addListener(_onChanged);
+    _updater.addListener(_onChanged);
     _portCtrl.text = _settings.serverPort.toString();
+    if (Platform.isAndroid) {
+      unawaited(_updater.checkForUpdate(silent: true));
+      unawaited(_refreshBackgroundHealth());
+    }
     if ((_settings.keepServerRunning || _settings.autoStartServer) &&
         !_server.isRunning &&
         !_server.isStarting) {
@@ -55,6 +73,15 @@ class _HomeScreenState extends State<HomeScreen>
           _startServer();
         }
       });
+    }
+  }
+
+  Future<void> _refreshBackgroundHealth() async {
+    if (!Platform.isAndroid) return;
+    await AndroidForegroundService.instance.syncServiceState();
+    final health = await AndroidForegroundService.instance.getBackgroundHealth();
+    if (mounted) {
+      setState(() => _backgroundHealth = health);
     }
   }
 
@@ -79,7 +106,8 @@ class _HomeScreenState extends State<HomeScreen>
             'Running in background • ${_server.activeSessions.length} active stream(s)',
       );
     } else if (state == AppLifecycleState.resumed) {
-      unawaited(_server.ensureRunningIfEnabled());
+      unawaited(_server.ensureRunningOrAutoStart());
+      unawaited(_refreshBackgroundHealth());
     }
   }
 
@@ -90,6 +118,8 @@ class _HomeScreenState extends State<HomeScreen>
     _server.removeListener(_onChanged);
     _engine.removeListener(_onChanged);
     _settings.removeListener(_onChanged);
+    _diskCache.removeListener(_onChanged);
+    _updater.removeListener(_onChanged);
     _magnetCtrl.dispose();
     _filePathCtrl.dispose();
     _portCtrl.dispose();
@@ -213,6 +243,30 @@ class _HomeScreenState extends State<HomeScreen>
     }
   }
 
+  Future<void> _handleCheckUpdate() async {
+    final info = await _updater.checkForUpdate(silent: false);
+    if (!mounted) return;
+    if (info != null) {
+      _showSnack(
+        info.hasUpdate
+            ? 'Update available: v${info.latestVersion}'
+            : 'Already up to date (v${info.currentVersion}).',
+      );
+    } else if (_updater.errorMessage != null) {
+      _showSnack(_updater.errorMessage!, error: true);
+    }
+  }
+
+  Future<void> _handleDownloadUpdate() async {
+    final apkPath = await _updater.downloadAndInstallUpdate();
+    if (!mounted) return;
+    if (apkPath == null && _updater.errorMessage != null) {
+      _showSnack(_updater.errorMessage!, error: true);
+    } else if (_updater.statusMessage != null) {
+      _showSnack(_updater.statusMessage!);
+    }
+  }
+
   // ─── Build ───────────────────────────────────────────────────────────────────
 
   @override
@@ -250,7 +304,8 @@ class _HomeScreenState extends State<HomeScreen>
             ),
             Tab(
               icon: Badge(
-                isLabelVisible: _settings.cacheUsageRatio > 0.8,
+                isLabelVisible:
+                    _settings.cacheUsageRatio > 0.8 || _updater.hasAvailableUpdate,
                 backgroundColor: Colors.amberAccent,
                 child: const Icon(Icons.tune_rounded),
               ),
@@ -266,11 +321,19 @@ class _HomeScreenState extends State<HomeScreen>
             server: _server,
             engine: _engine,
             settings: _settings,
+            updater: _updater,
             lifecycleState: _lifecycleState,
+            backgroundHealth: _backgroundHealth,
             onStart: _startServer,
             onStop: _stopServer,
             onCopy: _copyToClipboard,
             onNavigateSettings: () => _tabController.animateTo(2),
+            onTriggerUpdate: () => _handleDownloadUpdate(),
+            onFixBatteryExemption: () async {
+              await AndroidForegroundService.instance
+                  .requestBatteryOptimizationExemption();
+              await _refreshBackgroundHealth();
+            },
           ),
           _TorrentTab(
             engine: _engine,
@@ -286,10 +349,14 @@ class _HomeScreenState extends State<HomeScreen>
           ),
           _SettingsTab(
             settings: _settings,
+            diskCache: _diskCache,
             debridService: widget.debridService ?? DebridService.instance,
+            updater: _updater,
             portCtrl: _portCtrl,
             serverRunning: _server.isRunning,
             activeServerPort: _server.port,
+            backgroundHealth: _backgroundHealth,
+            onRefreshBackgroundHealth: _refreshBackgroundHealth,
             onRestartServer: () async {
               await _stopServer();
               await _startServer();
@@ -299,6 +366,21 @@ class _HomeScreenState extends State<HomeScreen>
               await _settings.refreshCacheUsage();
               _showSnack('Cache usage: ${_settings.cachedBytesFormatted}');
             },
+            onDeleteTorrentCache: (summary) async {
+              if (summary.isInUse) {
+                _showSnack(
+                  'Cannot delete "${summary.torrentName}" while actively streaming.',
+                  error: true,
+                );
+                return;
+              }
+              final freed = await _settings.deleteTorrentCache(summary.infoHash);
+              _showSnack(
+                'Removed cached torrent "${summary.torrentName}" (${formatBytes(freed)})',
+              );
+            },
+            onCheckForUpdate: _handleCheckUpdate,
+            onInstallUpdate: _handleDownloadUpdate,
             onShowMessage: _showSnack,
           ),
         ],
@@ -363,21 +445,29 @@ class _ServerTab extends StatelessWidget {
   final HttpStreamingServer server;
   final TorrentEngineService engine;
   final ServerSettingsService settings;
+  final AppUpdateService updater;
   final AppLifecycleState lifecycleState;
+  final BackgroundHealthStatus? backgroundHealth;
   final VoidCallback onStart;
   final VoidCallback onStop;
   final void Function(String, String) onCopy;
   final VoidCallback onNavigateSettings;
+  final VoidCallback onTriggerUpdate;
+  final VoidCallback onFixBatteryExemption;
 
   const _ServerTab({
     required this.server,
     required this.engine,
     required this.settings,
+    required this.updater,
     required this.lifecycleState,
+    required this.backgroundHealth,
     required this.onStart,
     required this.onStop,
     required this.onCopy,
     required this.onNavigateSettings,
+    required this.onTriggerUpdate,
+    required this.onFixBatteryExemption,
   });
 
   @override
@@ -387,10 +477,55 @@ class _ServerTab extends StatelessWidget {
     final sessions = server.activeSessions;
     final clients = server.connectedClients;
     final logs = server.activityLogs;
+    final needsBatteryFix =
+        backgroundHealth != null && !backgroundHealth!.ignoringBatteryOptimizations;
 
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (updater.hasAvailableUpdate) ...[
+          _UpdateAvailableBanner(
+            updater: updater,
+            onUpdateTap: onTriggerUpdate,
+          ),
+          const SizedBox(height: 12),
+        ],
+
+        if (needsBatteryFix) ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.amberAccent.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: Colors.amberAccent.withValues(alpha: 0.55),
+              ),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.battery_alert_rounded,
+                  color: Colors.amberAccent,
+                  size: 20,
+                ),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                    'Battery optimization is still restricting Torrent Bridge. Disable it to prevent Android from closing background torrenting.',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonal(
+                  onPressed: onFixBatteryExemption,
+                  child: const Text('Allow'),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
+
         // ── Big status hero ──────────────────────────────────────────────────
         _HeroServerCard(
           running: running,
@@ -874,7 +1009,13 @@ class _SessionCard extends StatelessWidget {
     final speed = formatSpeed(native?.downloadRate ?? 0);
     final peers = native?.activePeers ?? 0;
     final lanUrl = s.buildStreamUrl(ip, port);
-    final isReady = native?.isReady ?? false;
+    final isReady = s.isCached || (native?.isReady ?? false);
+    final cacheEntry = AudioDiskCacheService.instance.getEntry(
+      s.infoHash,
+      s.fileIndex,
+    );
+    final pieceCov = cacheEntry?.computePieceCoverage();
+    final cachedPctStr = (s.cachedPercentage * 100).toStringAsFixed(0);
 
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
@@ -934,7 +1075,8 @@ class _SessionCard extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           Text(
-            '↓ $speed  •  $peers peers  •  ${s.mimeType}  •  ${formatBytes(s.bytesServed)} served',
+            '↓ $speed  •  $peers peers  •  ${s.mimeType}  •  ${formatBytes(s.bytesServed)} served'
+            '${pieceCov != null && pieceCov.totalPieces > 0 ? "  •  ${pieceCov.downloadedPieces}/${pieceCov.totalPieces} pcs ($cachedPctStr%)" : ""}',
             style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
           const SizedBox(height: 8),
@@ -1423,24 +1565,38 @@ class _FileCard extends StatelessWidget {
 
 class _SettingsTab extends StatelessWidget {
   final ServerSettingsService settings;
+  final AudioDiskCacheService diskCache;
   final DebridService debridService;
+  final AppUpdateService updater;
   final TextEditingController portCtrl;
   final bool serverRunning;
   final int activeServerPort;
+  final BackgroundHealthStatus? backgroundHealth;
+  final Future<void> Function() onRefreshBackgroundHealth;
   final Future<void> Function() onRestartServer;
   final VoidCallback onClearCache;
   final VoidCallback onRefreshCache;
+  final Future<void> Function(CachedTorrentSummary summary) onDeleteTorrentCache;
+  final Future<void> Function() onCheckForUpdate;
+  final Future<void> Function() onInstallUpdate;
   final void Function(String message) onShowMessage;
 
   const _SettingsTab({
     required this.settings,
+    required this.diskCache,
     required this.debridService,
+    required this.updater,
     required this.portCtrl,
     required this.serverRunning,
     required this.activeServerPort,
+    required this.backgroundHealth,
+    required this.onRefreshBackgroundHealth,
     required this.onRestartServer,
     required this.onClearCache,
     required this.onRefreshCache,
+    required this.onDeleteTorrentCache,
+    required this.onCheckForUpdate,
+    required this.onInstallUpdate,
     required this.onShowMessage,
   });
 
@@ -1449,6 +1605,7 @@ class _SettingsTab extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
     final usageRatio = settings.cacheUsageRatio;
     final usagePct = (usageRatio * 100).toStringAsFixed(1);
+    final cachedTorrents = diskCache.getTorrentSummaries();
 
     Color gaugeColor = Colors.greenAccent;
     if (usageRatio >= 0.9) {
@@ -1638,6 +1795,126 @@ class _SettingsTab extends StatelessWidget {
                 ],
               ),
 
+              const SizedBox(height: 8),
+              Text(
+                'Seek & Read-Ahead Buffer (${settings.readAheadBufferFormatted})',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+              ),
+              const SizedBox(height: 6),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  _CachePresetChip(
+                    label: '8 MB',
+                    bytes: 8 * 1024 * 1024,
+                    selected: settings.readAheadBufferBytes == 8 * 1024 * 1024,
+                    onSelected: (b) => settings.setReadAheadBufferBytes(b),
+                  ),
+                  _CachePresetChip(
+                    label: '16 MB (Default)',
+                    bytes: 16 * 1024 * 1024,
+                    selected: settings.readAheadBufferBytes == 16 * 1024 * 1024,
+                    onSelected: (b) => settings.setReadAheadBufferBytes(b),
+                  ),
+                  _CachePresetChip(
+                    label: '32 MB',
+                    bytes: 32 * 1024 * 1024,
+                    selected: settings.readAheadBufferBytes == 32 * 1024 * 1024,
+                    onSelected: (b) => settings.setReadAheadBufferBytes(b),
+                  ),
+                  _CachePresetChip(
+                    label: '64 MB',
+                    bytes: 64 * 1024 * 1024,
+                    selected: settings.readAheadBufferBytes == 64 * 1024 * 1024,
+                    onSelected: (b) => settings.setReadAheadBufferBytes(b),
+                  ),
+                ],
+              ),
+
+              if (cachedTorrents.isNotEmpty) ...[
+                const Divider(height: 20),
+                Text(
+                  'Piece-Aware Cached Torrents (${cachedTorrents.length})',
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
+                ),
+                const SizedBox(height: 8),
+                ...cachedTorrents.map((t) {
+                  final pieceLabel = t.pieceLength > 0
+                      ? '${t.downloadedPieces}/${t.totalPieces} pcs (${formatBytes(t.pieceLength, decimals: 0)}/pc)'
+                      : '${t.downloadedPieces}/${t.totalPieces} blocks';
+                  final pct = (t.cachedPercentage * 100).toStringAsFixed(0);
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: cs.surfaceContainerHighest.withValues(alpha: 0.4),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: cs.outlineVariant.withValues(alpha: 0.3),
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                t.torrentName,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 12,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (t.isInUse)
+                              const _Chip(
+                                label: 'ACTIVE',
+                                color: Colors.greenAccent,
+                              )
+                            else
+                              IconButton(
+                                icon: const Icon(
+                                  Icons.delete_outline_rounded,
+                                  size: 18,
+                                  color: Colors.redAccent,
+                                ),
+                                tooltip: 'Delete torrent cache',
+                                constraints: const BoxConstraints(),
+                                padding: EdgeInsets.zero,
+                                onPressed: () => onDeleteTorrentCache(t),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: LinearProgressIndicator(
+                            value: t.cachedPercentage,
+                            minHeight: 5,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${formatBytes(t.cachedBytes)} / ${formatBytes(t.totalTorrentBytes)} ($pct%)  •  $pieceLabel  •  ${t.cachedFilesCount} file(s)',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontFamily: 'monospace',
+                            color: cs.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }),
+              ],
+
               const Divider(height: 20),
 
               // Cache actions & path
@@ -1778,8 +2055,370 @@ class _SettingsTab extends StatelessWidget {
           ),
         ),
 
+        const SizedBox(height: 16),
+
+        // ── 3b. Background Survival & OEM Power Settings (Android) ───────────
+        _BackgroundSurvivalCard(
+          health: backgroundHealth,
+          onRefresh: onRefreshBackgroundHealth,
+        ),
+
+        const SizedBox(height: 16),
+
+        // ── 4. App Update Section ────────────────────────────────────────────
+        _AppUpdateSettingsCard(
+          updater: updater,
+          onCheckForUpdate: onCheckForUpdate,
+          onInstallUpdate: onInstallUpdate,
+        ),
+
         const SizedBox(height: 24),
       ],
+    );
+  }
+}
+
+class _BackgroundSurvivalCard extends StatelessWidget {
+  final BackgroundHealthStatus? health;
+  final Future<void> Function() onRefresh;
+
+  const _BackgroundSurvivalCard({
+    required this.health,
+    required this.onRefresh,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final h = health;
+
+    return _SettingsCard(
+      icon: Icons.shield_rounded,
+      iconColor: h?.isHealthy == true ? Colors.tealAccent : Colors.amberAccent,
+      title: 'Background Survival (Non-Play Store)',
+      subtitle:
+          'Keeps the HTTP server & torrent session alive in the persistent foreground service even if Android closes the UI.',
+      child: h == null
+          ? Text(
+              Platform.isAndroid
+                  ? 'Checking Android background permissions…'
+                  : 'Android background service protections are active on Android devices.',
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _HealthCheckRow(
+                  label: 'Battery Optimization Exempt',
+                  ok: h.ignoringBatteryOptimizations,
+                  actionLabel: 'Disable',
+                  onAction: () async {
+                    await AndroidForegroundService.instance
+                        .requestBatteryOptimizationExemption();
+                    await onRefresh();
+                  },
+                ),
+                const SizedBox(height: 8),
+                _HealthCheckRow(
+                  label: 'Service Notification Allowed',
+                  ok: h.notificationPermissionGranted && h.notificationsEnabled,
+                  actionLabel: 'Enable',
+                  onAction: () async {
+                    await AndroidForegroundService.instance
+                        .requestNotificationPermission();
+                    if (!h.notificationsEnabled) {
+                      await AndroidForegroundService.instance.openAppSettings();
+                    }
+                    await onRefresh();
+                  },
+                ),
+                const SizedBox(height: 8),
+                _HealthCheckRow(
+                  label: 'Unrestricted Background Data',
+                  ok: h.unrestrictedBackgroundData,
+                  actionLabel: 'Allow',
+                  onAction: () async {
+                    await AndroidForegroundService.instance
+                        .openUnrestrictedDataSettings();
+                    await onRefresh();
+                  },
+                ),
+                const Divider(height: 20),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          await AndroidForegroundService.instance
+                              .openOemBackgroundSettings();
+                        },
+                        icon: const Icon(Icons.tune_rounded, size: 17),
+                        label: Text(
+                          h.isAggressiveOem
+                              ? '${h.manufacturer} Autostart & Battery'
+                              : 'OEM Power & Autostart',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton.outlined(
+                      tooltip: 'Refresh Background Status',
+                      onPressed: () => onRefresh(),
+                      icon: const Icon(Icons.refresh_rounded, size: 18),
+                    ),
+                  ],
+                ),
+                if (h.isAggressiveOem) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    'Tip for ${h.manufacturer} (${h.model}): enable Autostart and set Battery Saver to "No restrictions" for Torrent Bridge.',
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  ),
+                ],
+              ],
+            ),
+    );
+  }
+}
+
+class _HealthCheckRow extends StatelessWidget {
+  final String label;
+  final bool ok;
+  final String actionLabel;
+  final Future<void> Function() onAction;
+
+  const _HealthCheckRow({
+    required this.label,
+    required this.ok,
+    required this.actionLabel,
+    required this.onAction,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = ok ? Colors.greenAccent : Colors.amberAccent;
+    return Row(
+      children: [
+        Icon(
+          ok ? Icons.check_circle_rounded : Icons.warning_amber_rounded,
+          size: 16,
+          color: color,
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+          ),
+        ),
+        if (ok)
+          const _Chip(label: 'OK', color: Colors.greenAccent)
+        else
+          TextButton(
+            onPressed: () => onAction(),
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+            ),
+            child: Text(actionLabel),
+          ),
+      ],
+    );
+  }
+}
+
+class _UpdateAvailableBanner extends StatelessWidget {
+  final AppUpdateService updater;
+  final VoidCallback onUpdateTap;
+
+  const _UpdateAvailableBanner({
+    required this.updater,
+    required this.onUpdateTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final info = updater.latestInfo;
+    if (info == null || !info.hasUpdate) return const SizedBox.shrink();
+    final isDownloading = updater.phase == AppUpdatePhase.downloading;
+
+    return Container(
+      key: const Key('app_update_banner'),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: cs.primaryContainer.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: cs.primary.withValues(alpha: 0.6)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.system_update_rounded, color: cs.primary, size: 22),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Update Available: v${info.latestVersion}',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
+                      ),
+                    ),
+                    Text(
+                      updater.statusMessage ??
+                          'Installed: v${info.currentVersion}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: updater.isBusy ? null : onUpdateTap,
+                child: Text(isDownloading ? 'Downloading...' : 'Update'),
+              ),
+            ],
+          ),
+          if (isDownloading) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(value: updater.downloadProgress),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _AppUpdateSettingsCard extends StatelessWidget {
+  final AppUpdateService updater;
+  final Future<void> Function() onCheckForUpdate;
+  final Future<void> Function() onInstallUpdate;
+
+  const _AppUpdateSettingsCard({
+    required this.updater,
+    required this.onCheckForUpdate,
+    required this.onInstallUpdate,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final info = updater.latestInfo;
+    final phase = updater.phase;
+    final isChecking = phase == AppUpdatePhase.checking;
+    final isDownloading = phase == AppUpdatePhase.downloading;
+    final hasUpdate = info?.hasUpdate ?? false;
+
+    return _SettingsCard(
+      icon: Icons.system_update_rounded,
+      iconColor: cs.primary,
+      title: 'App Updates',
+      subtitle: 'Checks GitHub releases via update.json for new APK builds.',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Current Version: v${updater.currentVersion}',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+              if (info != null)
+                Text(
+                  'Latest: v${info.latestVersion}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontFamily: 'monospace',
+                    color: hasUpdate ? Colors.amberAccent : Colors.greenAccent,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+            ],
+          ),
+          if (updater.statusMessage != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              updater.statusMessage!,
+              key: const Key('app_update_status_text'),
+              style: TextStyle(
+                fontSize: 12,
+                color: phase == AppUpdatePhase.error
+                    ? Colors.redAccent
+                    : cs.onSurfaceVariant,
+              ),
+            ),
+          ],
+          if (isDownloading) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: LinearProgressIndicator(
+                key: const Key('app_update_progress'),
+                value: updater.downloadProgress,
+                minHeight: 8,
+              ),
+            ),
+          ],
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  key: const Key('app_update_check_button'),
+                  onPressed: updater.isBusy ? null : () => onCheckForUpdate(),
+                  icon: isChecking
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.refresh_rounded, size: 18),
+                  label: Text(
+                    isChecking ? 'Checking...' : 'Check for Updates',
+                  ),
+                ),
+              ),
+              if (hasUpdate) ...[
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.icon(
+                    key: const Key('app_update_install_button'),
+                    onPressed: updater.isBusy ? null : () => onInstallUpdate(),
+                    icon: isDownloading
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.download_rounded, size: 18),
+                    label: Text(
+                      isDownloading
+                          ? 'Downloading...'
+                          : 'Update v${info!.latestVersion}',
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

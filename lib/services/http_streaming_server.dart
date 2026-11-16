@@ -12,6 +12,7 @@ import 'android_foreground_service.dart';
 import 'audio_disk_cache_service.dart';
 import 'debrid_service.dart';
 import 'server_settings_service.dart';
+import 'stream_fetch_coordinator.dart';
 import 'torrent_engine_service.dart';
 
 /// Local Torrent-to-HTTP Audio Streaming Server for Mero Audiobook and
@@ -24,6 +25,7 @@ class HttpStreamingServer extends ChangeNotifier {
         await ServerSettingsService.instance.setKeepServerRunning(false);
         await stopServer();
       },
+      onNetworkChangedCallback: () => unawaited(_handleNetworkChanged()),
     );
     TorrentEngineService.instance.addListener(_onEngineUpdated);
   }
@@ -46,6 +48,12 @@ class HttpStreamingServer extends ChangeNotifier {
   /// Active streaming sessions keyed by sessionId.
   final Map<String, StreamingSession> _sessions = {};
 
+  /// Per-session seek, caching, and bounded sliding-window coordinator.
+  final Map<String, SessionStreamCoordinator> _coordinators = {};
+
+  /// Shared in-flight native stream activations per sessionId.
+  final Map<String, Future<void>> _pendingNativeActivations = {};
+
   /// In-flight session creation futures keyed by normalized request key.
   final Map<String, Future<StreamingSession>> _pendingSessions = {};
 
@@ -62,6 +70,9 @@ class HttpStreamingServer extends ChangeNotifier {
 
   @visibleForTesting
   bool skipTorrentEngineInit = false;
+
+  @visibleForTesting
+  UpstreamOpener? upstreamOpenerOverride;
 
   bool get isRunning => _httpServer != null;
   bool get isStarting => _isStarting;
@@ -246,18 +257,92 @@ class HttpStreamingServer extends ChangeNotifier {
     }
   }
 
+  /// Starts the server on startup/recovery when either `keepServerRunning` or
+  /// `autoStartServer` is enabled. Safe to invoke from headless `main()`.
+  Future<void> ensureRunningOrAutoStart() async {
+    final settings = ServerSettingsService.instance;
+    if ((settings.keepServerRunning || settings.autoStartServer) &&
+        !isRunning &&
+        !isStarting) {
+      try {
+        await startServer(port: settings.serverPort);
+      } catch (e) {
+        _log('Auto-start failed: $e');
+      }
+    }
+  }
+
+  Future<void> _handleNetworkChanged() async {
+    if (!isRunning) return;
+    final newIp = await resolveLocalIpv4();
+    if (newIp != _localIp) {
+      _localIp = newIp;
+      _log('Network changed -> updated LAN IP to $_localIp:$_port');
+      notifyListeners();
+    }
+    _syncForegroundNotification();
+    _ensureActivePrimaryTorrentAlive();
+  }
+
+  void _ensureActivePrimaryTorrentAlive() {
+    if (skipTorrentEngineInit || !LibtorrentFlutter.isInitialized) return;
+    final engineSvc = TorrentEngineService.instance;
+    final torrents = engineSvc.torrents;
+    for (final s in _sessions.values) {
+      if (s.isDebridStream || s.isCached || s.torrentId < 0) continue;
+      if (!s.isPrimary) continue;
+      final t = torrents[s.torrentId];
+      if (t != null &&
+          t.isPaused &&
+          !engineSvc.isManuallyPaused(s.torrentId)) {
+        engineSvc.resumeTorrent(s.torrentId);
+        _log('Watchdog resumed primary torrent #${s.torrentId} (${s.fileName})');
+      }
+    }
+  }
+
   void _onMaintenanceTick() {
     _syncForegroundNotification();
+    _ensureActivePrimaryTorrentAlive();
+
+    // Sync cached progress on active sessions
+    final cacheSvc = AudioDiskCacheService.instance;
+    var anyUpdated = false;
+    for (final s in _sessions.values) {
+      final entry = cacheSvc.getEntry(s.infoHash, s.fileIndex);
+      if (entry != null) {
+        if (s.cachedBytes != entry.cachedBytes ||
+            s.isCached != entry.isComplete) {
+          s.cachedBytes = entry.cachedBytes;
+          s.cachedPercentage = entry.cachedPercentage;
+          s.isCached = entry.isComplete;
+          anyUpdated = true;
+        }
+      }
+    }
+    if (anyUpdated) {
+      notifyListeners();
+    }
+
     _maintenanceTickCounter++;
-    if (_maintenanceTickCounter % 3 == 0 && _sessions.isNotEmpty) {
-      unawaited(
-        ServerSettingsService.instance.checkAndEnforceCacheLimit(
-          protectedInfoHashes: _sessions.values.map((s) => s.infoHash).toSet(),
-          protectedRelativePaths: _sessions.values
-              .map((s) => s.filePath)
-              .toSet(),
-        ),
-      );
+    if (_maintenanceTickCounter % 3 == 0) {
+      unawaited(() async {
+        final latestIp = await resolveLocalIpv4();
+        if (latestIp != _localIp && isRunning) {
+          _localIp = latestIp;
+          notifyListeners();
+        }
+      }());
+      if (_sessions.isNotEmpty) {
+        unawaited(
+          ServerSettingsService.instance.checkAndEnforceCacheLimit(
+            protectedInfoHashes: _sessions.values.map((s) => s.infoHash).toSet(),
+            protectedRelativePaths: _sessions.values
+                .map((s) => s.filePath)
+                .toSet(),
+          ),
+        );
+      }
     }
   }
 
@@ -288,6 +373,11 @@ class HttpStreamingServer extends ChangeNotifier {
     for (final sid in sessionIds) {
       stopSession(sid);
     }
+    for (final coord in _coordinators.values) {
+      coord.dispose();
+    }
+    _coordinators.clear();
+    _pendingNativeActivations.clear();
     _sessions.clear();
     _pendingSessions.clear();
     _activeClients.clear();
@@ -438,6 +528,142 @@ class HttpStreamingServer extends ChangeNotifier {
       return session;
     }
 
+    // Fast path B (P2P mode): If partial cache or persisted manifest exists,
+    // create the session immediately with zero peer-metadata wait so cached
+    // pieces play instantly and uncached pieces warm up in the background.
+    final manifest = cacheSvc.getManifest(normalizedHash);
+    if (!settings.hasConfiguredDebrid &&
+        ((cachedEntry != null &&
+                cachedEntry.fileSize > 0 &&
+                cachedEntry.cachedBytes > 0) ||
+            (manifest != null && manifest.files.isNotEmpty))) {
+      final resolvedMf = cachedEntry == null
+          ? manifest?.findFile(fileIndex: fileIndex, filePath: filePath)
+          : manifest?.fileAtIndex(cachedEntry.fileIndex);
+
+      final resolvedFileIndex =
+          cachedEntry?.fileIndex ?? resolvedMf?.index ?? fileIndex ?? 0;
+      final resolvedFileName = (cachedEntry?.fileName.isNotEmpty == true)
+          ? cachedEntry!.fileName
+          : (resolvedMf?.name ?? 'audio_$resolvedFileIndex.bin');
+      final resolvedFilePath = (cachedEntry?.filePath.isNotEmpty == true)
+          ? cachedEntry!.filePath
+          : (resolvedMf?.path ?? resolvedFileName);
+      final resolvedFileSize = (cachedEntry != null && cachedEntry.fileSize > 0)
+          ? cachedEntry.fileSize
+          : (resolvedMf?.size ?? 0);
+      final resolvedMime = (cachedEntry?.mimeType.isNotEmpty == true &&
+              cachedEntry!.mimeType != 'application/octet-stream')
+          ? cachedEntry.mimeType
+          : (resolvedMf?.mimeType ??
+              AudioFileEntry.mimeTypeForExtension(
+                AudioFileEntry.extractExtension(resolvedFileName),
+              ));
+      final resolvedTorrentName =
+          (manifest?.torrentName.isNotEmpty == true)
+              ? manifest!.torrentName
+              : ((cachedEntry?.torrentName.isNotEmpty == true)
+                  ? cachedEntry!.torrentName
+                  : normalizedHash);
+
+      if (resolvedFileSize > 0) {
+        for (final existing in _sessions.values) {
+          if (existing.infoHash == normalizedHash &&
+              existing.fileIndex == resolvedFileIndex) {
+            existing.lastAccessedAt = DateTime.now();
+            if (cachedEntry != null) {
+              existing.cachedBytes = cachedEntry.cachedBytes;
+              existing.cachedPercentage = cachedEntry.cachedPercentage;
+              existing.isCached = cachedEntry.isComplete;
+              cacheSvc.recordAccess(cachedEntry.key);
+            }
+            for (final s in _sessions.values) {
+              s.isPrimary = (s.sessionId == existing.sessionId);
+            }
+            if (!existing.isCached && !skipTorrentEngineInit) {
+              unawaited(_warmUpNativeStreamAndSync(existing));
+            }
+            _log(
+              'Reusing instant partial-cache session ${existing.sessionId} for "$resolvedFileName"',
+            );
+            notifyListeners();
+            return existing;
+          }
+        }
+
+        final diskEntry = cachedEntry ??
+            await cacheSvc.ensureEntry(
+              infoHash: normalizedHash,
+              fileIndex: resolvedFileIndex,
+              torrentName: resolvedTorrentName,
+              fileName: resolvedFileName,
+              filePath: resolvedFilePath,
+              mimeType: resolvedMime,
+              fileSize: resolvedFileSize,
+              pieceLength: manifest?.pieceLength ?? 0,
+              fileOffsetInTorrent: resolvedMf?.offsetInTorrent,
+            );
+
+        _sessionCounter++;
+        final ext = AudioFileEntry.extractExtension(resolvedFileName);
+        final formatLabel =
+            ext.isEmpty ? 'RAW' : ext.substring(1).toUpperCase();
+        final shortHash = normalizedHash.substring(
+          0,
+          math.min(8, normalizedHash.length),
+        );
+        final sessionId =
+            's${_sessionCounter}_smart_${shortHash}_$resolvedFileIndex';
+
+        for (final s in _sessions.values) {
+          s.isPrimary = false;
+        }
+
+        final engineSvc = TorrentEngineService.instance;
+        final existingTorrentId =
+            engineSvc.getTorrentIdForInfoHash(normalizedHash) ?? -1;
+
+        final session = StreamingSession(
+          sessionId: sessionId,
+          torrentId: existingTorrentId,
+          nativeStreamId: -1,
+          magnetUri: manifest?.magnetUri.isNotEmpty == true
+              ? manifest!.magnetUri
+              : magnetUri,
+          infoHash: normalizedHash,
+          torrentName: resolvedTorrentName,
+          fileIndex: resolvedFileIndex,
+          fileName: resolvedFileName,
+          filePath: resolvedFilePath,
+          fileSize: resolvedFileSize,
+          mimeType: resolvedMime,
+          formatLabel: formatLabel,
+          nativeStreamUrl: '',
+          createdAt: DateTime.now(),
+          isPrimary: true,
+          isCached: diskEntry.isComplete,
+          cachedBytes: diskEntry.cachedBytes,
+          cachedPercentage: diskEntry.cachedPercentage,
+          lastAccessedAt: DateTime.now(),
+        );
+
+        _sessions[sessionId] = session;
+        cacheSvc.recordAccess(diskEntry.key);
+        ServerSettingsService.instance.recordAccess(normalizedHash);
+        _log(
+          'Created zero-wait manifest/cache session $sessionId -> [$resolvedFileIndex] $resolvedFileName '
+          '(${(diskEntry.cachedPercentage * 100).toStringAsFixed(0)}% cached on disk)',
+        );
+        _syncForegroundNotification();
+        notifyListeners();
+
+        if (!diskEntry.isComplete && !skipTorrentEngineInit) {
+          unawaited(_warmUpNativeStreamAndSync(session));
+        }
+        return session;
+      }
+    }
+
     // Debrid-first path when user has configured a Debrid provider + API key
     if (settings.hasConfiguredDebrid) {
       final activeProvider = settings.debridProvider;
@@ -482,6 +708,8 @@ class HttpStreamingServer extends ChangeNotifier {
           diskEntry = await cacheSvc.ensureEntry(
             infoHash: resolved.infoHash,
             fileIndex: resolved.fileIndex,
+            torrentName:
+                '${activeProvider.displayName} • ${resolved.fileName}',
             fileName: resolved.fileName,
             filePath: resolved.filePath,
             mimeType: resolved.mimeType,
@@ -627,14 +855,27 @@ class HttpStreamingServer extends ChangeNotifier {
         engineSvc.getInfoHashForTorrent(torrentId) ?? normalizedHash;
     final resolvedMagnet =
         engineSvc.getMagnetForTorrent(torrentId) ?? magnetUri;
+    final inferredPieceLen =
+        TorrentManifest.inferPieceLengthFromReadaheadWindow(
+      streamInfo.readaheadWindow,
+    );
+    final resolvedManifest = cacheSvc.getManifest(infoHash);
+    final mf = resolvedManifest?.fileAtIndex(targetFile.index);
 
     final diskEntry = await cacheSvc.ensureEntry(
       infoHash: infoHash,
       fileIndex: targetFile.index,
+      torrentName: torrentInfo.name.isNotEmpty
+          ? torrentInfo.name
+          : (resolvedManifest?.torrentName ?? ''),
       fileName: targetFile.name,
       filePath: targetFile.path,
       mimeType: targetFile.mimeType,
       fileSize: resolvedSize,
+      pieceLength: inferredPieceLen > 0
+          ? inferredPieceLen
+          : (resolvedManifest?.pieceLength ?? 0),
+      fileOffsetInTorrent: mf?.offsetInTorrent,
     );
 
     _sessionCounter++;
@@ -670,12 +911,16 @@ class HttpStreamingServer extends ChangeNotifier {
 
     _sessions[sessionId] = session;
 
-    // Apply priority & preloading for this newest torrent
+    // Apply priority & cache window settings for this newest torrent
     await engineSvc.prioritizeTorrentAndFile(
       torrentId,
       fileIndex: targetFile.index,
       streamId: streamInfo.id,
     );
+
+    if (!diskEntry.isComplete) {
+      _coordinatorFor(session).scheduleHeadTailWarmup();
+    }
 
     _log(
       'Created primary stream session $sessionId -> [${targetFile.index}] ${targetFile.path} (${formatBytes(resolvedSize)})'
@@ -684,6 +929,61 @@ class HttpStreamingServer extends ChangeNotifier {
     _syncForegroundNotification();
     notifyListeners();
     return session;
+  }
+
+  SessionStreamCoordinator _coordinatorFor(StreamingSession session) {
+    final existing = _coordinators[session.sessionId];
+    if (existing != null && !existing.isDisposed) {
+      return existing;
+    }
+    final created = SessionStreamCoordinator(
+      session: session,
+      openUpstream: upstreamOpenerOverride ?? _openUpstreamResponse,
+      onUpstreamStall: _handleUpstreamStall,
+      log: _log,
+    );
+    _coordinators[session.sessionId] = created;
+    return created;
+  }
+
+  Future<void> _warmUpNativeStreamAndSync(StreamingSession session) async {
+    if (skipTorrentEngineInit || session.isDebridStream || session.isCached) {
+      return;
+    }
+    try {
+      await _ensureNativeStreamActive(session);
+      if (!session.isCached) {
+        _coordinatorFor(session).scheduleHeadTailWarmup();
+      }
+    } catch (e) {
+      _log('Background torrent warmup deferred for ${session.fileName}: $e');
+    }
+  }
+
+  Future<void> _handleUpstreamStall(
+    StreamingSession session, {
+    required int failedOffset,
+    required bool seemsStuckAtZero,
+  }) async {
+    if (session.isDebridStream || skipTorrentEngineInit) return;
+    final engineSvc = TorrentEngineService.instance;
+    if (session.torrentId >= 0) {
+      engineSvc.resumeTorrent(session.torrentId);
+    }
+    if (seemsStuckAtZero) {
+      _log(
+        'Resetting native stream #${session.nativeStreamId} (stuck at readHead=0 while seeking to $failedOffset)',
+      );
+      final info = await engineSvc.resetNativeStreamForSession(
+        magnetUri: session.magnetUri,
+        fileIndex: session.fileIndex,
+        previousStreamId: session.nativeStreamId,
+      );
+      session.torrentId = info.torrentId;
+      session.nativeStreamId = info.id;
+      session.nativeStreamUrl = info.url;
+      session.latestNativeInfo = info;
+    }
   }
 
   /// Lazily ensures a native `libtorrent_flutter` stream is running for [session]
@@ -700,22 +1000,60 @@ class HttpStreamingServer extends ChangeNotifier {
       }
     }
 
-    final info = await engineSvc.ensureNativeStreamForSession(
-      magnetUri: session.magnetUri,
-      fileIndex: session.fileIndex,
-    );
-    session.torrentId = info.torrentId;
-    session.nativeStreamId = info.id;
-    session.nativeStreamUrl = info.url;
-    session.latestNativeInfo = info;
-    if (session.fileSize <= 0 && info.fileSize > 0) {
-      session.fileSize = info.fileSize;
+    final pending = _pendingNativeActivations[session.sessionId];
+    if (pending != null) {
+      await pending;
+      return;
+    }
+
+    final completer = Completer<void>();
+    _pendingNativeActivations[session.sessionId] = completer.future;
+    try {
+      final info = await engineSvc.ensureNativeStreamForSession(
+        magnetUri: session.magnetUri,
+        fileIndex: session.fileIndex,
+      );
+      session.torrentId = info.torrentId;
+      session.nativeStreamId = info.id;
+      session.nativeStreamUrl = info.url;
+      session.latestNativeInfo = info;
+      if (session.fileSize <= 0 && info.fileSize > 0) {
+        session.fileSize = info.fileSize;
+      }
+      final inferredPieceLen =
+          TorrentManifest.inferPieceLengthFromReadaheadWindow(
+        info.readaheadWindow,
+      );
+      if (inferredPieceLen > 0 && AudioDiskCacheService.instance.isInitialized) {
+        final manifest =
+            AudioDiskCacheService.instance.getManifest(session.infoHash);
+        final mf = manifest?.fileAtIndex(session.fileIndex);
+        await AudioDiskCacheService.instance.ensureEntry(
+          infoHash: session.infoHash,
+          fileIndex: session.fileIndex,
+          torrentName: session.torrentName,
+          fileName: session.fileName,
+          filePath: session.filePath,
+          mimeType: session.mimeType,
+          fileSize: session.fileSize,
+          pieceLength: inferredPieceLen,
+          fileOffsetInTorrent: mf?.offsetInTorrent,
+        );
+      }
+      completer.complete();
+    } catch (e, st) {
+      completer.completeError(e, st);
+      rethrow;
+    } finally {
+      _pendingNativeActivations.remove(session.sessionId);
     }
   }
 
   /// Stops and removes a specific [StreamingSession].
   void stopSession(String sessionId) {
     final session = _sessions.remove(sessionId);
+    _coordinators.remove(sessionId)?.dispose();
+    _pendingNativeActivations.remove(sessionId);
     if (session == null) return;
     try {
       TorrentEngineService.instance.stopNativeStream(session.nativeStreamId);
@@ -821,7 +1159,7 @@ class HttpStreamingServer extends ChangeNotifier {
         return;
       }
 
-      // 6. Cache Endpoints: GET|DELETE /api/cache
+      // 6. Cache Endpoints: GET|DELETE /api/cache and DELETE /api/cache/torrent/<infoHash>
       if (path == '/api/cache') {
         if (req.method == 'GET') {
           await _handleCacheGet(req);
@@ -830,6 +1168,26 @@ class HttpStreamingServer extends ChangeNotifier {
           await _handleCacheDelete(req);
           return;
         }
+      }
+      if (segments.length == 4 &&
+          segments[0] == 'api' &&
+          segments[1] == 'cache' &&
+          segments[2] == 'torrent' &&
+          req.method == 'DELETE') {
+        final hash = segments[3];
+        final freed = await ServerSettingsService.instance.deleteTorrentCache(
+          hash,
+        );
+        await _sendJson(req.response, HttpStatus.ok, {
+          'status': 'ok',
+          'infohash': hash,
+          'freed_bytes': freed,
+          'freed_formatted': formatBytes(freed),
+          'remaining_bytes': ServerSettingsService.instance.cachedBytes,
+          'remaining_formatted':
+              ServerSettingsService.instance.cachedBytesFormatted,
+        });
+        return;
       }
 
       // 7. Settings Endpoints: GET|POST /api/settings
@@ -1077,6 +1435,15 @@ class HttpStreamingServer extends ChangeNotifier {
           (json['max_cache_size_mb'] as num).toInt() * 1024 * 1024,
         );
       }
+      if (json['read_ahead_buffer_bytes'] is num) {
+        await settings.setReadAheadBufferBytes(
+          (json['read_ahead_buffer_bytes'] as num).toInt(),
+        );
+      } else if (json['read_ahead_buffer_mb'] is num) {
+        await settings.setReadAheadBufferBytes(
+          (json['read_ahead_buffer_mb'] as num).toInt() * 1024 * 1024,
+        );
+      }
 
       if (json['prioritize_newest'] is bool) {
         await settings.setPrioritizeNewest(json['prioritize_newest'] as bool);
@@ -1268,112 +1635,34 @@ class HttpStreamingServer extends ChangeNotifier {
             return;
           }
 
-          var currentOffset = parsed.start;
-          var anyMissDownloaded = false;
+          final initialCachedBytes = cacheEntry?.cachedBytes ?? 0;
+          final coordinator = _coordinatorFor(session);
+          final rangeStream = coordinator.streamRange(
+            parsed.start,
+            parsed.end,
+            onBytesYielded: (byteCount) {
+              clientInfo.bytesTransferred += byteCount;
+              session.bytesServed += byteCount;
+            },
+          );
 
+          final iterator = StreamIterator<List<int>>(rangeStream);
+          var iteratorOwnedByStream = false;
           try {
-            while (currentOffset <= parsed.end) {
-              final covering = cacheEntry?.findCoveringRange(currentOffset);
-              if (covering != null && cacheEntry != null) {
-                commitHeaders();
-                final segEnd = math.min(covering.end, parsed.end);
-                await for (final chunk in cacheSvc.openCachedRangeStream(
-                  cacheEntry.key,
-                  currentOffset,
-                  segEnd,
-                )) {
-                  res.add(chunk);
-                  clientInfo.bytesTransferred += chunk.length;
-                  session.bytesServed += chunk.length;
-                }
-                currentOffset = segEnd + 1;
-                continue;
+            final hasFirst = await iterator.moveNext();
+            if (!hasFirst) {
+              // Superseded by a newer seek before first byte was sent
+              if (!headersCommitted) {
+                res.statusCode = HttpStatus.serviceUnavailable;
+                await res.close();
               }
-
-              // Cache miss for currentOffset..segEnd: fetch only up to next cached hole
-              final nextCached = cacheEntry?.findNextCachedRangeAfter(
-                currentOffset,
-              );
-              final segEnd = nextCached != null
-                  ? math.min(nextCached.start - 1, parsed.end)
-                  : parsed.end;
-
-              final upstreamRes = await _openUpstreamResponse(
-                session,
-                method: 'GET',
-                rangeHeader: 'bytes=$currentOffset-$segEnd',
-              );
-
-              commitHeaders();
-
-              if (cacheEntry == null && cacheSvc.isInitialized) {
-                cacheEntry = await cacheSvc.ensureEntry(
-                  infoHash: session.infoHash,
-                  fileIndex: session.fileIndex,
-                  fileName: session.fileName,
-                  filePath: session.filePath,
-                  mimeType: session.mimeType,
-                  fileSize: session.fileSize,
-                );
-              }
-
-              var upstreamPos = _resolveUpstreamStartOffset(
-                upstreamRes,
-                fallbackStart: currentOffset,
-              );
-              anyMissDownloaded = true;
-
-              if (cacheEntry != null) {
-                cacheSvc.acquireWriteLock(cacheEntry.key);
-              }
-              try {
-                await for (final chunk in upstreamRes) {
-                  if (chunk.isEmpty) continue;
-                  final chunkStart = upstreamPos;
-                  final chunkEnd = upstreamPos + chunk.length - 1;
-                  upstreamPos += chunk.length;
-
-                  // Slice if upstream returned bytes outside [currentOffset, segEnd]
-                  if (chunkEnd < currentOffset) continue;
-                  if (chunkStart > segEnd) break;
-
-                  final sliceStart = math.max(0, currentOffset - chunkStart);
-                  final sliceEndExclusive = math.min(
-                    chunk.length,
-                    segEnd - chunkStart + 1,
-                  );
-                  if (sliceEndExclusive <= sliceStart) continue;
-
-                  final effectiveChunk =
-                      (sliceStart == 0 && sliceEndExclusive == chunk.length)
-                      ? chunk
-                      : chunk.sublist(sliceStart, sliceEndExclusive);
-                  final writeOffset = chunkStart + sliceStart;
-
-                  if (cacheEntry != null) {
-                    await cacheSvc.writeChunk(
-                      cacheEntry.key,
-                      writeOffset,
-                      effectiveChunk,
-                      totalFileSize: session.fileSize,
-                    );
-                  }
-
-                  res.add(effectiveChunk);
-                  clientInfo.bytesTransferred += effectiveChunk.length;
-                  session.bytesServed += effectiveChunk.length;
-                }
-              } finally {
-                if (cacheEntry != null) {
-                  await cacheSvc.releaseWriteLock(cacheEntry.key);
-                  session.cachedBytes = cacheEntry.cachedBytes;
-                  session.cachedPercentage = cacheEntry.cachedPercentage;
-                  session.isCached = cacheEntry.isComplete;
-                }
-              }
-
-              currentOffset = segEnd + 1;
+              return;
             }
+            commitHeaders();
+            iteratorOwnedByStream = true;
+            await res.addStream(
+              _streamFromIterator(iterator.current, iterator),
+            );
           } on DebridException catch (e) {
             _lastError = e.message;
             _log('Debrid upstream failed: ${e.message}');
@@ -1386,13 +1675,35 @@ class HttpStreamingServer extends ChangeNotifier {
               return;
             }
             rethrow;
+          } catch (e) {
+            if (!headersCommitted) {
+              try {
+                await _sendJson(res, HttpStatus.badGateway, {
+                  'error': e.toString(),
+                });
+                return;
+              } catch (_) {}
+            }
+            rethrow;
+          } finally {
+            if (!iteratorOwnedByStream) {
+              await iterator.cancel().catchError((_) {});
+            }
           }
 
-          commitHeaders();
           await res.flush();
           await res.close();
 
-          if (anyMissDownloaded) {
+          final updatedEntry = cacheSvc.getEntry(
+            session.infoHash,
+            session.fileIndex,
+          );
+          if (updatedEntry != null) {
+            session.cachedBytes = updatedEntry.cachedBytes;
+            session.cachedPercentage = updatedEntry.cachedPercentage;
+            session.isCached = updatedEntry.isComplete;
+          }
+          if ((updatedEntry?.cachedBytes ?? 0) > initialCachedBytes) {
             unawaited(
               ServerSettingsService.instance.checkAndEnforceCacheLimit(
                 protectedInfoHashes: _sessions.values
@@ -1501,20 +1812,22 @@ class HttpStreamingServer extends ChangeNotifier {
         cacheSvc.acquireWriteLock(cacheEntry.key);
       }
       try {
-        await for (final chunk in upstreamRes) {
-          if (cacheEntry != null && chunk.isNotEmpty) {
-            await cacheSvc.writeChunk(
-              cacheEntry.key,
-              fallbackOffset,
-              chunk,
-              totalFileSize: session.fileSize > 0 ? session.fileSize : null,
-            );
-            fallbackOffset += chunk.length;
-          }
-          res.add(chunk);
-          clientInfo.bytesTransferred += chunk.length;
-          session.bytesServed += chunk.length;
-        }
+        await res.addStream(
+          upstreamRes.asyncMap((chunk) async {
+            if (cacheEntry != null && chunk.isNotEmpty) {
+              await cacheSvc.writeChunk(
+                cacheEntry.key,
+                fallbackOffset,
+                chunk,
+                totalFileSize: session.fileSize > 0 ? session.fileSize : null,
+              );
+              fallbackOffset += chunk.length;
+            }
+            clientInfo.bytesTransferred += chunk.length;
+            session.bytesServed += chunk.length;
+            return chunk;
+          }),
+        );
       } finally {
         if (cacheEntry != null) {
           await cacheSvc.releaseWriteLock(cacheEntry.key);
@@ -1541,10 +1854,25 @@ class HttpStreamingServer extends ChangeNotifier {
     }
   }
 
+  Stream<List<int>> _streamFromIterator(
+    List<int> firstChunk,
+    StreamIterator<List<int>> iterator,
+  ) async* {
+    try {
+      yield firstChunk;
+      while (await iterator.moveNext()) {
+        yield iterator.current;
+      }
+    } finally {
+      await iterator.cancel().catchError((_) {});
+    }
+  }
+
   Future<HttpClientResponse> _openUpstreamResponse(
     StreamingSession session, {
     required String method,
     String? rangeHeader,
+    void Function(void Function())? attachAbort,
   }) async {
     Future<HttpClientResponse> doOpen(
       String url, {
@@ -1556,6 +1884,11 @@ class HttpStreamingServer extends ChangeNotifier {
       if (rangeHeader != null && rangeHeader.isNotEmpty) {
         req.headers.set(HttpHeaders.rangeHeader, rangeHeader);
       }
+      attachAbort?.call(() {
+        try {
+          req.abort();
+        } catch (_) {}
+      });
       return req.close();
     }
 

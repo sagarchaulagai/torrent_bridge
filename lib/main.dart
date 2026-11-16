@@ -1,11 +1,23 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'screens/home_screen.dart';
+import 'services/http_streaming_server.dart';
 import 'services/server_settings_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ServerSettingsService.instance.init();
+
+  // Start the HTTP server directly from main() when keepServerRunning or
+  // autoStartServer is enabled so headless background restarts (e.g. Android
+  // START_STICKY / boot) bring the server back online even before any UI frame.
+  if (ServerSettingsService.instance.keepServerRunning ||
+      ServerSettingsService.instance.autoStartServer) {
+    unawaited(HttpStreamingServer.instance.ensureRunningOrAutoStart());
+  }
+
   runApp(const TorrentAudioStreamerApp());
 }
 

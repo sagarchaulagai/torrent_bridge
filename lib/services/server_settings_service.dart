@@ -18,9 +18,13 @@ class ServerSettingsService extends ChangeNotifier {
   static const int kDefaultCacheLimitBytes = 2 * 1024 * 1024 * 1024; // 2 GB
   static const int kMinCacheLimitBytes = 128 * 1024 * 1024; // 128 MB
   static const int kMaxCacheLimitBytes = 16 * 1024 * 1024 * 1024; // 16 GB
+  static const int kDefaultReadAheadBytes = 16 * 1024 * 1024; // 16 MB
+  static const int kMinReadAheadBytes = 4 * 1024 * 1024; // 4 MB
+  static const int kMaxReadAheadBytes = 64 * 1024 * 1024; // 64 MB
 
   bool _isLoaded = false;
   int _maxCacheSizeBytes = kDefaultCacheLimitBytes;
+  int _readAheadBufferBytes = kDefaultReadAheadBytes;
   bool _prioritizeNewest = true;
   bool _autoPauseBackgroundTorrents = true;
   bool _fastAudioPreload = true;
@@ -49,6 +53,8 @@ class ServerSettingsService extends ChangeNotifier {
 
   bool get isLoaded => _isLoaded;
   int get maxCacheSizeBytes => _maxCacheSizeBytes;
+  int get readAheadBufferBytes => _readAheadBufferBytes;
+  String get readAheadBufferFormatted => formatBytes(_readAheadBufferBytes);
   bool get prioritizeNewest => _prioritizeNewest;
   bool get autoPauseBackgroundTorrents => _autoPauseBackgroundTorrents;
   bool get fastAudioPreload => _fastAudioPreload;
@@ -87,25 +93,38 @@ class ServerSettingsService extends ChangeNotifier {
   String get cachedBytesFormatted => formatBytes(_cachedBytes);
 
   /// Initializes paths and loads persisted preferences.
-  Future<void> init() async {
-    if (_isLoaded) return;
+  Future<void> init({
+    String? overrideCachePath,
+    bool forceReload = false,
+  }) async {
+    if (_isLoaded && !forceReload && overrideCachePath == null) return;
     try {
-      Directory baseDir;
-      try {
-        baseDir = await getApplicationSupportDirectory();
-      } catch (_) {
-        baseDir = Directory.systemTemp;
+      Directory dir;
+      if (overrideCachePath != null && overrideCachePath.isNotEmpty) {
+        dir = Directory(overrideCachePath);
+      } else {
+        Directory baseDir;
+        try {
+          baseDir = await getApplicationSupportDirectory();
+        } catch (_) {
+          baseDir = Directory.systemTemp;
+        }
+        dir = Directory(
+          '${baseDir.path}${Platform.pathSeparator}torrent_audio_cache',
+        );
       }
-      final dir = Directory(
-        '${baseDir.path}${Platform.pathSeparator}torrent_audio_cache',
-      );
       if (!await dir.exists()) {
         await dir.create(recursive: true);
       }
       _cachePath = dir.path;
 
+      _lastAccessedMap.clear();
+      _infoHashToRootName.clear();
       await _loadSettingsFile();
-      await AudioDiskCacheService.instance.init(baseCachePath: _cachePath);
+      await AudioDiskCacheService.instance.init(
+        baseCachePath: _cachePath,
+        forceReload: forceReload || overrideCachePath != null,
+      );
       await refreshCacheUsage();
       _isLoaded = true;
       notifyListeners();
@@ -130,6 +149,11 @@ class ServerSettingsService extends ChangeNotifier {
         final json = jsonDecode(content) as Map<String, dynamic>;
         _maxCacheSizeBytes = (json['max_cache_size_bytes'] as num?)?.toInt() ??
             kDefaultCacheLimitBytes;
+        final savedRa = (json['read_ahead_buffer_bytes'] as num?)?.toInt();
+        if (savedRa != null && savedRa > 0) {
+          _readAheadBufferBytes =
+              savedRa.clamp(kMinReadAheadBytes, kMaxReadAheadBytes);
+        }
         _prioritizeNewest = json['prioritize_newest'] as bool? ?? true;
         _autoPauseBackgroundTorrents =
             json['auto_pause_background'] as bool? ?? true;
@@ -210,6 +234,7 @@ class ServerSettingsService extends ChangeNotifier {
       }
       final json = {
         'max_cache_size_bytes': _maxCacheSizeBytes,
+        'read_ahead_buffer_bytes': _readAheadBufferBytes,
         'cache_default_2gb_migrated': _cacheDefault2GbMigrated,
         'prioritize_newest': _prioritizeNewest,
         'auto_pause_background': _autoPauseBackgroundTorrents,
@@ -254,6 +279,15 @@ class ServerSettingsService extends ChangeNotifier {
       notifyListeners();
       await _saveSettingsFile();
       await checkAndEnforceCacheLimit();
+    }
+  }
+
+  Future<void> setReadAheadBufferBytes(int bytes) async {
+    final clamped = bytes.clamp(kMinReadAheadBytes, kMaxReadAheadBytes);
+    if (_readAheadBufferBytes != clamped) {
+      _readAheadBufferBytes = clamped;
+      notifyListeners();
+      await _saveSettingsFile();
     }
   }
 
@@ -441,6 +475,7 @@ class ServerSettingsService extends ChangeNotifier {
             // Exclude our internal config & sidecar metadata files from cache stats
             if (entity.path.endsWith('settings_config.json') ||
                 entity.path.endsWith('.meta.json') ||
+                entity.path.endsWith('.manifest.json') ||
                 entity.path.endsWith('.tmp')) {
               continue;
             }
@@ -479,8 +514,8 @@ class ServerSettingsService extends ChangeNotifier {
           if (entity.path.endsWith('settings_config.json')) continue;
 
           final basename = entity.path.split(Platform.pathSeparator).last;
-          // AudioDiskCacheService owns `<cachePath>/streams` and protects active readers/writers.
-          if (basename == 'streams') continue;
+          // AudioDiskCacheService owns `<cachePath>/streams` and `<cachePath>/manifests`.
+          if (basename == 'streams' || basename == 'manifests') continue;
           final matchedHash = _matchInfoHashForBasename(basename);
           if (_isBasenameProtected(basename, protectedNormalized, matchedHash)) {
             continue;
@@ -522,6 +557,45 @@ class ServerSettingsService extends ChangeNotifier {
     return freedBytes;
   }
 
+  /// Deletes all unlocked cached data (smart stream cache, manifest, and raw
+  /// torrent folder) associated with [infoHash].
+  Future<int> deleteTorrentCache(String infoHash) async {
+    if (_cachePath.isEmpty || infoHash.trim().isEmpty) return 0;
+    final hashLower = infoHash.trim().toLowerCase();
+    var freed = await AudioDiskCacheService.instance.deleteTorrentCache(hashLower);
+
+    final stillInUse = AudioDiskCacheService.instance.entries.values
+        .any((e) => e.infoHash == hashLower);
+    if (!stillInUse) {
+      final rootName = _infoHashToRootName[hashLower];
+      if (rootName != null && rootName.isNotEmpty) {
+        final rawTarget = Directory(
+          '$_cachePath${Platform.pathSeparator}$rootName',
+        );
+        try {
+          if (await rawTarget.exists()) {
+            await for (final f in rawTarget.list(recursive: true)) {
+              if (f is File) freed += await f.length();
+            }
+            await rawTarget.delete(recursive: true);
+          } else {
+            final rawFile = File(rawTarget.path);
+            if (await rawFile.exists()) {
+              freed += await rawFile.length();
+              await rawFile.delete();
+            }
+          }
+        } catch (_) {}
+      }
+      _lastAccessedMap.remove(hashLower);
+      _infoHashToRootName.remove(hashLower);
+      await _saveSettingsFile();
+    }
+
+    await refreshCacheUsage();
+    return freed;
+  }
+
   /// Checks if cached bytes exceed [_maxCacheSizeBytes]. If so, incrementally evicts
   /// the oldest accessed cached files until usage is <= 95% of capacity.
   Future<void> checkAndEnforceCacheLimit({
@@ -557,6 +631,7 @@ class ServerSettingsService extends ChangeNotifier {
         if (entity is! File) continue;
         if (entity.path.endsWith('settings_config.json') ||
             entity.path.endsWith('.meta.json') ||
+            entity.path.endsWith('.manifest.json') ||
             entity.path.endsWith('.tmp')) {
           continue;
         }
@@ -568,7 +643,7 @@ class ServerSettingsService extends ChangeNotifier {
         final topSegment = relNorm
             .split('/')
             .firstWhere((seg) => seg.isNotEmpty, orElse: () => relNorm);
-        if (topSegment == 'streams') {
+        if (topSegment == 'streams' || topSegment == 'manifests') {
           // Handled safely by AudioDiskCacheService with reader/writer locks.
           continue;
         }
@@ -596,6 +671,9 @@ class ServerSettingsService extends ChangeNotifier {
         final isProtectedByPath = normalizedProtectedPaths != null &&
             normalizedProtectedPaths.contains(relNorm.toLowerCase());
 
+        final isDuplicateOfCompleteCache = matchedHash != null &&
+            AudioDiskCacheService.instance.isTorrentFullyCached(matchedHash);
+
         items.add(_CacheItemEntry(
           entity: entity,
           infoHash: matchedHash,
@@ -603,13 +681,18 @@ class ServerSettingsService extends ChangeNotifier {
           lastAccessedMs: torrentAccessMs,
           fileModifiedMs: fileModifiedMs,
           isProtected: isProtectedByHash || isProtectedByPath,
+          isDuplicateTemp: isDuplicateOfCompleteCache,
         ));
       }
 
-      // Sort unprotected items oldest-first (by torrent access time, then file mtime).
+      // Sort unprotected items: redundant raw copies of 100%-cached torrents first,
+      // then oldest-first (by torrent access time, then file mtime).
       items.sort((a, b) {
         if (a.isProtected != b.isProtected) {
           return a.isProtected ? 1 : -1;
+        }
+        if (a.isDuplicateTemp != b.isDuplicateTemp) {
+          return a.isDuplicateTemp ? -1 : 1;
         }
         final accessCmp = a.lastAccessedMs.compareTo(b.lastAccessedMs);
         if (accessCmp != 0) return accessCmp;
@@ -673,6 +756,8 @@ class ServerSettingsService extends ChangeNotifier {
   Map<String, dynamic> toJson() => {
         'max_cache_size_bytes': _maxCacheSizeBytes,
         'max_cache_size_formatted': maxCacheSizeFormatted,
+        'read_ahead_buffer_bytes': _readAheadBufferBytes,
+        'read_ahead_buffer_formatted': readAheadBufferFormatted,
         'cached_bytes': _cachedBytes,
         'cached_bytes_formatted': cachedBytesFormatted,
         'cache_usage_ratio': cacheUsageRatio,
@@ -702,6 +787,7 @@ class _CacheItemEntry {
   final int lastAccessedMs;
   final int fileModifiedMs;
   final bool isProtected;
+  final bool isDuplicateTemp;
 
   _CacheItemEntry({
     required this.entity,
@@ -710,5 +796,6 @@ class _CacheItemEntry {
     required this.lastAccessedMs,
     required this.fileModifiedMs,
     required this.isProtected,
+    this.isDuplicateTemp = false,
   });
 }

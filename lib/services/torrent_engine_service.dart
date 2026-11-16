@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:libtorrent_flutter/libtorrent_flutter.dart';
 
 import '../models/streaming_models.dart';
+import 'audio_disk_cache_service.dart';
 import 'server_settings_service.dart';
 
 /// Service managing the native `libtorrent_flutter` engine lifecycle,
@@ -30,6 +31,10 @@ class TorrentEngineService extends ChangeNotifier {
 
   /// Cached file lists per torrentId once metadata is available
   final Map<int, List<AudioFileEntry>> _cachedFiles = {};
+
+  /// Tracks torrents explicitly paused by the user (so background keep-alive
+  /// watchdog never resumes a torrent the user intentionally paused).
+  final Set<int> _manuallyPausedTorrents = {};
 
   StreamSubscription<Map<int, TorrentInfo>>? _torrentSub;
   StreamSubscription<Map<int, StreamInfo>>? _streamSub;
@@ -107,8 +112,22 @@ class TorrentEngineService extends ChangeNotifier {
 
     final engine = LibtorrentFlutter.instance;
     _torrentSub = engine.torrentUpdates.listen((torrentMap) {
+      // Remove stale ID mappings if native engine disposed an ephemeral torrent
+      final staleIds = _torrentIdToInfoHash.keys
+          .where((tid) => !torrentMap.containsKey(tid))
+          .toList();
+      for (final tid in staleIds) {
+        final hash = _torrentIdToInfoHash.remove(tid);
+        if (hash != null && _infoHashToTorrentId[hash] == tid) {
+          _infoHashToTorrentId.remove(hash);
+        }
+        _torrentIdToMagnet.remove(tid);
+        _cachedFiles.remove(tid);
+        _manuallyPausedTorrents.remove(tid);
+      }
+
       final hasAny = torrentMap.isNotEmpty;
-      if (hasAny || _hadTorrents) {
+      if (hasAny || _hadTorrents || staleIds.isNotEmpty) {
         _hadTorrents = hasAny;
         notifyListeners();
       }
@@ -172,6 +191,12 @@ class TorrentEngineService extends ChangeNotifier {
       _torrentIdToInfoHash[torrentId];
 
   String? getMagnetForTorrent(int torrentId) => _torrentIdToMagnet[torrentId];
+
+  int? getTorrentIdForInfoHash(String infoHash) =>
+      _infoHashToTorrentId[infoHash.trim().toLowerCase()];
+
+  bool isManuallyPaused(int torrentId) =>
+      _manuallyPausedTorrents.contains(torrentId);
 
   /// Adds a torrent by magnet link or infohash, or returns the existing torrent ID
   /// if it was already added to the session.
@@ -260,7 +285,9 @@ class TorrentEngineService extends ChangeNotifier {
     try {
       final info = await completer.future;
       _cachedFiles.remove(torrentId);
-      _registerRootName(torrentId, fallbackName: info.name);
+      final files = getFiles(torrentId);
+      _registerRootName(torrentId, files: files, fallbackName: info.name);
+      _persistManifestIfReady(torrentId, files: files, torrentInfo: info);
       return info;
     } finally {
       await sub.cancel();
@@ -329,7 +356,39 @@ class TorrentEngineService extends ChangeNotifier {
       files: entries,
       fallbackName: torrentInfo?.name,
     );
+    _persistManifestIfReady(
+      torrentId,
+      files: entries,
+      torrentInfo: torrentInfo,
+    );
     return entries;
+  }
+
+  void _persistManifestIfReady(
+    int torrentId, {
+    List<AudioFileEntry>? files,
+    TorrentInfo? torrentInfo,
+    int? pieceLength,
+  }) {
+    final hash = _torrentIdToInfoHash[torrentId];
+    if (hash == null || hash.isEmpty) return;
+    if (!AudioDiskCacheService.instance.isInitialized) return;
+
+    final fileList = files ?? _cachedFiles[torrentId];
+    if ((fileList == null || fileList.isEmpty) &&
+        (pieceLength == null || pieceLength <= 0)) {
+      return;
+    }
+
+    unawaited(
+      AudioDiskCacheService.instance.saveTorrentManifest(
+        infoHash: hash,
+        torrentName: torrentInfo?.name,
+        magnetUri: _torrentIdToMagnet[torrentId],
+        pieceLength: pieceLength,
+        files: fileList,
+      ),
+    );
   }
 
   /// Resolves an [AudioFileEntry] in [torrentId] by [filePath] or [fileIndex].
@@ -450,6 +509,15 @@ class TorrentEngineService extends ChangeNotifier {
         if (existing.fileSize > 0) {
           _knownFileSizes['$torrentId:$fileIndex'] = existing.fileSize;
         }
+        final inferredPieceLen =
+            TorrentManifest.inferPieceLengthFromReadaheadWindow(
+          existing.readaheadWindow,
+        );
+        _persistManifestIfReady(
+          torrentId,
+          torrentInfo: engine.torrents[torrentId],
+          pieceLength: inferredPieceLen,
+        );
         prioritizeTorrentAndFile(torrentId, fileIndex: fileIndex, streamId: existing.id);
         return existing;
       }
@@ -463,6 +531,16 @@ class TorrentEngineService extends ChangeNotifier {
     if (info.fileSize > 0) {
       _knownFileSizes['$torrentId:$fileIndex'] = info.fileSize;
     }
+
+    final inferredPieceLen =
+        TorrentManifest.inferPieceLengthFromReadaheadWindow(
+      info.readaheadWindow,
+    );
+    _persistManifestIfReady(
+      torrentId,
+      torrentInfo: engine.torrents[torrentId],
+      pieceLength: inferredPieceLen,
+    );
 
     prioritizeTorrentAndFile(torrentId, fileIndex: fileIndex, streamId: info.id);
 
@@ -481,6 +559,26 @@ class TorrentEngineService extends ChangeNotifier {
     return startNativeStream(torrentId, fileIndex: fileIndex);
   }
 
+  /// Stops a stalled native stream and recreates a fresh native stream so a
+  /// stuck `readHead == 0` / tail-seek priority lock in `libtorrent_flutter` clears.
+  Future<StreamInfo> resetNativeStreamForSession({
+    required String magnetUri,
+    required int fileIndex,
+    int? previousStreamId,
+  }) async {
+    if (previousStreamId != null &&
+        previousStreamId > 0 &&
+        LibtorrentFlutter.isInitialized) {
+      try {
+        LibtorrentFlutter.instance.stopStream(previousStreamId);
+      } catch (_) {}
+    }
+    return ensureNativeStreamForSession(
+      magnetUri: magnetUri,
+      fileIndex: fileIndex,
+    );
+  }
+
   /// Sets [torrentId] and [fileIndex] as the newest primary requested torrent.
   ///
   /// Automatically deprioritizes/pauses background torrents, sets file priority to 7
@@ -497,6 +595,7 @@ class TorrentEngineService extends ChangeNotifier {
     final engine = LibtorrentFlutter.instance;
 
     // 1. Resume the target torrent
+    _manuallyPausedTorrents.remove(torrentId);
     engine.resumeTorrent(torrentId);
 
     // 2. Pause background torrents if auto-pause is enabled
@@ -531,21 +630,20 @@ class TorrentEngineService extends ChangeNotifier {
       }
     }
 
-    // 4. Preload and configure TorrServer cache if stream is provided
+    // 4. Configure TorrServer RAM cache for the stream.
+    // Note: Head/tail + lookahead preloading is handled in Dart by the
+    // StreamFetchCoordinator so seeks can cancel preload instantaneously and
+    // every downloaded byte is persisted in AudioDiskCacheService.
     if (streamId != null) {
       try {
         engine.setCacheSettings(
           streamId,
           capacity: 64 * 1024 * 1024,
           readAheadPct: 95,
-          connectionsLimit: 30,
+          connectionsLimit: 32,
         );
-        if (settings.fastAudioPreload) {
-          final ok = engine.preloadStream(streamId);
-          debugPrint('TorrentEngine: Preloaded stream #$streamId: $ok');
-        }
       } catch (e) {
-        debugPrint('TorrentEngine: Error configuring stream cache/preload: $e');
+        debugPrint('TorrentEngine: Error configuring stream cache: $e');
       }
     }
 
@@ -565,14 +663,18 @@ class TorrentEngineService extends ChangeNotifier {
     notifyListeners();
   }
 
-  void pauseTorrent(int torrentId) {
+  void pauseTorrent(int torrentId, {bool userInitiated = true}) {
     if (!LibtorrentFlutter.isInitialized) return;
+    if (userInitiated) {
+      _manuallyPausedTorrents.add(torrentId);
+    }
     LibtorrentFlutter.instance.pauseTorrent(torrentId);
     notifyListeners();
   }
 
   void resumeTorrent(int torrentId) {
     if (!LibtorrentFlutter.isInitialized) return;
+    _manuallyPausedTorrents.remove(torrentId);
     LibtorrentFlutter.instance.resumeTorrent(torrentId);
     notifyListeners();
   }
@@ -645,6 +747,7 @@ class TorrentEngineService extends ChangeNotifier {
     _torrentIdToMagnet.clear();
     _knownFileSizes.clear();
     _cachedFiles.clear();
+    _manuallyPausedTorrents.clear();
     notifyListeners();
   }
 
@@ -661,6 +764,7 @@ class TorrentEngineService extends ChangeNotifier {
     _torrentIdToMagnet.clear();
     _knownFileSizes.clear();
     _cachedFiles.clear();
+    _manuallyPausedTorrents.clear();
     notifyListeners();
   }
 }

@@ -1,0 +1,1467 @@
+
+Public
+ENVIRONMENT
+Production
+LAYOUT
+Double Column
+LANGUAGE
+cURL - cURL
+Main API
+Introduction
+Torrents
+Usenet
+Web Downloads/Debrid
+General
+Notifications
+User
+RSS Feeds
+Integrations
+Queued
+Stream
+Main API
+Full documentation for TorBox
+
+Current API Base: https://api.torbox.app
+
+Current API Version: v1
+
+You can find more API docs here: http://api.torbox.app/docs (they aren't as great as these, but is in a format most people would be familiar to).
+General Information
+
+    You can rely on both success booleans or status codes to determine if a call was a success. Status code 200 always means a success. 403 means authentication error. 500 means something went wrong on TorBox's end. 400 means the user did something wrong, or an input wasn't correct, or expected.
+
+    There will always be a user-friendly message in detail for a reason why a call was a failure, or a success message. You may forward these directly to users.
+
+    The /usenet and the /webdl API endpoints are nearly the same as the /torrents API endpoints apart from some different named inputs and outputs.
+
+    All outputs are JSON unless otherwise specified. Check out the examples to be sure.
+
+Rate Limits
+
+    Unless stated below, all endpoints are rate limited to 300/min per API token, no edge rate limiting.
+
+    POST /torrents/createtorrent is rate limited to 60/hour for uncached items per API token, 300/min if the items are cached. Please read the documentation for more information.
+
+    POST /usenet/createusenetdownload is rate limited to 60/hour per API token.
+
+    POST /webdl/createwebdownload is rate limited to 60/hour per API token.
+
+    We no longer accept IP whitelisting requests due to rate limiting being API token based, rather than IP based.
+
+Standard Response
+
+Below is the standard JSON response that most requests will return. In short, always use the "success" key to determine if a request was successful or not, "error" to determine the exact error reason, "detail" as a user-friendly message whether success or error, and data contains the response information you are looking for.
+View More
+json
+
+{
+    "success": boolean, // whether a response is successful or not
+    "error": string, // an error code if there was an error, or null if success
+    "detail": string, // a user-friendly message
+    "data": any // usually an object/dict, but can be anything, check the examples
+}
+
+Errors Table
+
+Errors codes are part of the standard response type. If the code ends in "ERROR", the error is the server's fault else that error is something that the client caused.
+View More
+Error Code	Error Meaning
+DATABASE_ERROR	Could not access internal database/memory store information.
+UNKNOWN_ERROR	The reason for the error is unknown. Usually there will be error data attached in the "data" key. In these cases please report the request to contact@torbox.app.
+NO_AUTH	There are no provided credentials.
+BAD_TOKEN	The provided token is invalid.
+AUTH_ERROR	There was an error verifying the given authentication.
+INVALID_OPTION	The provided option is invalid.
+REDIRECT_ERROR	The server tried redirecting, but it faulted.
+OAUTH_VERIFICATION_ERROR	The server tried verifying your OAuth token, but it was not accepted by the provider.
+ENDPOINT_NOT_FOUND	If you have hit an endpoint that doesn't exist.
+ITEM_NOT_FOUND	The item you queried cannot be found.
+PLAN_RESTRICTED_FEATURE	This feature is restricted to users of higher plans. The user is recommended to upgrade their plan to use this endpoint.
+DUPLICATE_ITEM	This item already exists.
+BOZO_RSS_FEED	This RSS feed is invalid or not a well-formed XML.
+TOO_MUCH_DATA	Client sent too much data to the API. Please keep requests under 100MB in size.
+DOWNLOAD_TOO_LARGE	This download is oversized for the user's plan. The user is recommended to upgrade their plan to download this file.  
+  
+Free Plan Limit: 10737418240 bytes  
+Essential Plan Limit: 214748364800 bytes  
+Standard Plan Limit: 214748364800 bytes  
+Pro Plan Limit: 536870912000 bytes
+MISSING_REQUIRED_OPTION	The API is missing required information to process the request.
+TOO_MANY_OPTIONS	Client sent too many options. Usually this has to do with the API requiring only 1 option but the client sent more than the required.
+BOZO_TORRENT	The torrent sent is not a valid torrent.
+NO_SERVERS_AVAILABLE_ERROR	There are no download servers available to handle this request. This should never happen. If you receieve this error, please contact us at contact@torbox.app.
+MONTHLY_LIMIT	User has hit the maximum monthly limit. It is recommended user upgrade their account to be able to download more.
+COOLDOWN_LIMIT	User is on download cooldown. It is recommended user upgrade their account to be able to bypass this restriction.
+ACTIVE_LIMIT	User has hit their max active download limit. It is recommended user upgrade their account or purchase addons to bypass this restriction.
+DOWNLOAD_SERVER_ERROR	There was an error interacting with the download on the download server. It is recommdned to simply wait some time before trying again.
+BOZO_NZB	The NZB sent is not a valid NZB file.
+SEARCH_ERROR	There was an error searching using the TorBox Search API.
+INVALID_DEVICE	The client is sending requests from the incorrect device.
+DIFF_ISSUE	The request parameters sent does not allow for this request to complete.
+LINK_OFFLINE	The link given is inaccessible or has no online files.
+VENDOR_DISABLED	This vendor account has been disabled. Please contact support.
+BOZO_REGEX	The regex you entered is bad.
+BAD_CONFIRMATION	The confirmation code you have given is invalid.
+CONFIRMATION_EXPIRED	The confirmation code you have given is expired. Request a new code.
+BOZO_FILE	This file doesn't match the required mimetype. Please use a different file.
+Translation to Real-Debrid API
+
+Useful for if you want to add TorBox to an app where Real-Debrid is already existing. These are the API routes that are nearly the same with Real-Debrid API routes. You will have to change things such as parameters and check outputs as they both are not the same. You can find docs to Real-Debrid's API here.
+Real-Debrid API Routes	TorBox API Routes
+GET /torrents	GET /torrents/mylist
+GET /torrents/info/{id}	GET /torrents/mylist?id={id}
+GET /torrents/instantAvailability/{hash}	GET /torrents/checkcached
+PUT /torrents/addTorrent	POST /torrents/createtorrent
+POST /torrents/addMagnet	POST /torrents/createtorrent
+POST /torrents/selectFiles/{id}	None, not needed. Torrents will download all files. This will not be changed.
+DELETE /torrents/delete/{id}	POST /torrents/controltorrent
+POST /unrestrict/link	GET /torrents/requestdl
+Dates
+
+All dates returned from the API are normalized to UTC time. All dates are in the format:
+
+%Y-%m-%dT%H:%M:%SZ
+
+Example: 2024-10-21T20:47:03Z = The 21st of October, 2024 at 8:47:03 PM UTC.
+
+This makes it easy for users and integrations to parse these dates and change them to the user's time zone for better UX. For more information on these formats, you can take a look at this cheat sheet.
+SDK
+
+There are many official and even non-official community created SDKs that wrap TorBox's API making it simple for developers to easily and quickly create applications using TorBox's API with their native programming language. There are already SDKs for the most popular languages and more are being added all the time!
+
+Note: Being the official SDK does not mean you should use it over another SDK of the same language. There are some very impressive and highly updated SDKs!
+Language	Project Link	Official
+Python	https://github.com/TorBox-App/torbox-sdk-py	YES
+Python	https://github.com/eliasbenb/TorBox.py	NO
+Javascript/Typescript	https://github.com/TorBox-App/torbox-sdk-js	YES
+Javascript/Typescript	https://www.npmjs.com/package/node-torbox-api	NO
+Go	https://github.com/TorBox-App/torbox-sdk-go	YES
+C#	https://github.com/asylumexp/TorBox.NET	NO
+AUTHORIZATIONBearer Token
+Token
+
+{{api_key}}
+POSTCreate Torrent
+https://api.torbox.app/v1/api/torrents/createtorrent
+Overview
+
+Creates a torrent under your account. Simply send either a magnet link, or a torrent file. Once they have been checked, they will begin downloading assuming your account has available active download slots, and they aren't too large.
+Rate Limits
+
+This endpoint has two limits that apply at the same time:
+
+    300 requests per minute: a shared ceiling that every request counts against, whether the torrent is cached or uncached.
+
+    60 uncached torrents per hour: an additional, stricter limit that only uncached torrents count against.
+
+The important thing is that cached and uncached requests both draw from the same 300/min pool, but uncached requests also draw from their own separate 60/hour pool. An uncached request therefore counts twice: once against the per-minute limit, and once against the per-hour uncached limit.
+
+Example: In a single minute you add 250 cached + 50 uncached torrents. That's 300 total, so you've hit the per-minute limit for that minute. But those 50 uncached torrents also came out of your 60/hour uncached budget, leaving only 10 uncached torrents for the remaining 59 minutes of that hour. (You could still add plenty more cached torrents during that hour, since cached requests aren't capped hourly: only by the 300/min ceiling.)
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+Token
+
+{{api_key}}
+Bodyformdata
+file
+
+The torrent's torrent file. Optional.
+magnet
+
+string
+
+The torrent's magnet link. Optional.
+seed
+
+int
+
+Tells TorBox your preference for seeding this torrent. 1 is auto. 2 is seed. 3 is don't seed. Optional. Default is 1, or whatever the user has in their settings. Overwrites option in settings.
+allow_zip
+
+boolean
+
+Tells TorBox if you want to allow this torrent to be zipped or not. TorBox only zips if the torrent is 100 files or larger.
+name
+
+string
+
+The name you want the torrent to be. Optional.
+as_queued
+
+boolean
+
+Tells TorBox you want this torrent instantly queued. This is bypassed if user is on free plan, and will process the request as normal in this case. Optional.
+add_only_if_cached
+
+boolean
+
+Only adds the download if it is cached on TorBox. If not cached, it won't be added.
+Example Request
+Success
+curl
+
+curl --location 'https://api.torbox.app/v1/api/torrents/createtorrent' \
+--form 'file=@"/path/to/file"' \
+--form 'magnet="string"' \
+--form 'seed="int"' \
+--form 'allow_zip="boolean"' \
+--form 'name="string"' \
+--form 'as_queued="boolean"' \
+--form 'add_only_if_cached="boolean"'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent Added Successfully",
+  "data": {
+    "hash": "string",
+    "torrent_id": 0,
+    "auth_id": "string"
+  }
+}
+
+POSTAsync Create Torrent
+https://api.torbox.app/v1/api/torrents/asynccreatetorrent
+Overview
+
+Creates a torrent asynchrously under your account. Simply send either a magnet link, or a torrent file. Once they have been checked, they will begin downloading assuming your account has available active download slots, and they aren't too large.
+
+The request will return instantly, not returning any data other than a success message. This is the same for failures, as they will return the error in the background, rather than immediately.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+Token
+
+{{api_key}}
+Bodyformdata
+file
+
+The torrent's torrent file. Optional.
+magnet
+
+string
+
+The torrent's magnet link. Optional.
+seed
+
+int
+
+Tells TorBox your preference for seeding this torrent. 1 is auto. 2 is seed. 3 is don't seed. Optional. Default is 1, or whatever the user has in their settings. Overwrites option in settings.
+allow_zip
+
+boolean
+
+Tells TorBox if you want to allow this torrent to be zipped or not. TorBox only zips if the torrent is 100 files or larger.
+name
+
+string
+
+The name you want the torrent to be. Optional.
+as_queued
+
+boolean
+
+Tells TorBox you want this torrent instantly queued. This is bypassed if user is on free plan, and will process the request as normal in this case. Optional.
+add_only_if_cached
+
+boolean
+
+Only adds the download if it is cached on TorBox. If not cached, it won't be added.
+Example Request
+Success
+curl
+
+curl --location 'https://api.torbox.app/v1/api/torrents/asynccreatetorrent' \
+--form 'file=@"/path/to/file"' \
+--form 'magnet="string"' \
+--form 'seed="int"' \
+--form 'allow_zip="boolean"' \
+--form 'name="string"' \
+--form 'as_queued="boolean"' \
+--form 'add_only_if_cached="boolean"'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent creation request has been queued. You will receive a notification when it is processed.",
+  "data": null
+}
+
+GETRequest Download Links - GET
+https://api.torbox.app/v1/api/torrents/requestdl/batch?token=&torrent_id=&file_ids=&user_ip=&append_name=
+Overview
+
+Requests multiple download links from the server. Because downloads are metered, TorBox cannot afford to allow free access to the links directly. This endpoint opens the link for 3 hours for downloads. Once a download is started, the user has nearly unlilimited time to download the file. The 1 hour time limit is simply for starting downloads. This prevents long term link sharing.
+Authorization
+
+Requires an API key as a parameter for the token parameter.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+token
+
+Your API Key
+torrent_id
+
+The torrent's ID that you want to download
+file_ids
+
+The files's ID that you want to download
+user_ip
+
+The user's IP to determine the closest CDN. Optional.
+append_name
+
+If you want to add the "filename" parameter to the returned CDN link. Optional. Default false.
+Example Request
+Success
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/torrents/requestdl/batch?token=&torrent_id=&file_ids=&user_ip=&append_name='
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent links requested successfully.",
+  "data": [
+    "https://example.com/file1",
+    "https://example.com/file2"
+  ]
+}
+
+POSTRequest Download Links - POST
+https://api.torbox.app/v1/api/torrents/requestdl/batch?token=&torrent_id=&user_ip=&append_name=
+Overview
+
+Requests multiple download links from the server. Because downloads are metered, TorBox cannot afford to allow free access to the links directly. This endpoint opens the link for 3 hours for downloads. Once a download is started, the user has nearly unlilimited time to download the file. The 1 hour time limit is simply for starting downloads. This prevents long term link sharing.
+Authorization
+
+Requires an API key as a parameter for the token parameter.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+token
+
+Your API Key
+torrent_id
+
+The torrent's ID that you want to download
+user_ip
+
+The user's IP to determine the closest CDN. Optional.
+append_name
+
+If you want to add the "filename" parameter to the returned CDN link. Optional. Default false.
+Bodyraw (json)
+json
+
+{
+    "file_ids": [
+        0, 1, 2
+    ]
+}
+
+Example Request
+Success
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/torrents/requestdl/batch?token=&torrent_id=&user_ip=&append_name=' \
+--data '{
+    "file_ids": [
+        0, 1, 2
+    ]
+}'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent links requested successfully.",
+  "data": [
+    "https://example.com/file1",
+    "https://example.com/file2"
+  ]
+}
+
+GETGet Torrent Cached Availability
+https://api.torbox.app/v1/api/torrents/checkcached?hash=&format=object&list_files=
+Overview
+
+Takes in a list of comma separated torrent hashes and checks if the torrent is cached. This endpoint only gets a max of around 100 at a time, due to http limits in queries. If you want to do more, you can simply do more hash queries. Such as:
+?hash=XXXX&hash=XXXX&hash=XXXX
+
+or ?hash=XXXX,XXXX&hash=XXXX&hash=XXXX,XXXX
+and this will work too. Performance is very fast. Less than 1 second per 100. Time is approximately O(log n) time for those interested in taking it to its max. That is without caching as well. This endpoint stores a cache for an hour.
+
+You may also pass a format parameter with the format you want the data in. Options are either object or list. You can view examples of both below.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+hash
+
+The list of torrent hashes you want to check. Comma seperated.
+format
+
+object
+
+Format you want the data in. Acceptable is either "object" or "list". List is the most performant option as it doesn't require modification of the list.
+list_files
+
+Allows you to list the files found inside the cached data.
+Example Request
+Success FILES OBJECT
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/torrents/checkcached?hash=&format=object&list_files=true'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent cache status retrieved successfully.",
+  "data": {
+    "string": {
+      "name": "string",
+      "size": 0,
+      "hash": "string",
+      "files": [
+        {
+          "id": 0,
+          "name": "string",
+          "size": 0,
+          "opensubtitles_hash": "string",
+          "short_name": "string",
+          "mimetype": "string"
+        }
+      ]
+    }
+  }
+}
+
+POSTGet Torrent Cached Availability Batch
+https://api.torbox.app/v1/api/torrents/checkcached
+Overview
+
+Takes in a list of comma separated torrent hashes and checks if the torrent is cached. With the POST endpoint you can submit a nearly unlimited hashes compared to the GET endpoint which is limited by url parameters.
+
+Performance is very fast. Less than 1 second per 100. Time is approximately O(log n) time for those interested in taking it to its max. That is without caching as well. This endpoint stores a cache for an hour.
+
+You may also pass a format parameter with the format you want the data in. Options are either object or list. You can view examples of both below.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+Bodyraw (json)
+json
+
+{
+    "hashes": [
+        "string",
+        "string"
+    ]
+}
+
+Example Request
+Success FILES OBJECT
+curl
+
+curl --location 'https://api.torbox.app/v1/api/torrents/checkcached' \
+--data '{
+    "hashes": [
+        "string",
+        "string"
+    ]
+}'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent cache status retrieved successfully.",
+  "data": {
+    "string": {
+      "name": "string",
+      "size": 0,
+      "hash": "string",
+      "files": [
+        {
+          "id": 0,
+          "name": "string",
+          "size": 0,
+          "opensubtitles_hash": "string",
+          "short_name": "string",
+          "mimetype": "string"
+        }
+      ]
+    }
+  }
+}
+
+GETRequest Download Link
+https://api.torbox.app/v1/api/usenet/requestdl?token=&usenet_id=&file_id=&zip_link=&user_ip=&redirect=&append_name=
+Overview
+
+Requests the download link from the server. Because downloads are metered, TorBox cannot afford to allow free access to the links directly. This endpoint opens the link for 3 hours for downloads. Once a download is started, the user has nearly unlilimited time to download the file. The 1 hour time limit is simply for starting downloads. This prevents long term link sharing.
+Permalinks
+
+Instead of generating many CDN urls by requesting this endpoint, you can instead create a permalink such as: https://api.torbox.app/v1/api/torrents/requestdl?token=APIKEY&torrent_id=NUMBER&file_id=NUMBER&redirect=true and when a user clicks on it, it will automatically redirect them to the CDN link. This saves requests and doesn't abuse the API. Use this method rather than saving CDN links as they are not permanent. To invalidate these permalinks, simply reset your API token or delete the item from your dashboard.
+Authorization
+
+Requires an API key as a parameter for the token parameter.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+token
+
+Your API Key
+usenet_id
+
+The usenet download's ID that you want to download
+file_id
+
+The files's ID that you want to download. Optional if using "zip_link".
+zip_link
+
+If you want a zip link. Required if no file_id. Takes precedence over file_id if both are given.
+user_ip
+
+The user's IPv4 to determine the closest CDN. Optional.
+redirect
+
+If you want to redirect the user to the CDN link. This is useful for creating permalinks so that you can just make this request URL the link.
+append_name
+
+If you want to add the "filename" parameter to the returned CDN link. Optional. Default false.
+Example Request
+Success
+curl
+
+curl --location 'https://api.torbox.app/v1/api/usenet/requestdl?token=&usenet_id='
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Usenet download requested successfully.",
+  "data": "https://tb-cdn.xx/dld/XXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX?token=XXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+}
+
+GETRequest Download Links - GET
+https://api.torbox.app/v1/api/usenet/requestdl/batch?token=&usenet_id=&file_ids=&user_ip=&append_name=
+Overview
+
+Requests multiple download links from the server. Because downloads are metered, TorBox cannot afford to allow free access to the links directly. This endpoint opens the link for 3 hours for downloads. Once a download is started, the user has nearly unlilimited time to download the file. The 1 hour time limit is simply for starting downloads. This prevents long term link sharing.
+Authorization
+
+Requires an API key as a parameter for the token parameter.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+token
+
+Your API Key
+usenet_id
+
+The usenet download's ID that you want to download
+file_ids
+
+The files's ID that you want to download
+user_ip
+
+The user's IP to determine the closest CDN. Optional.
+append_name
+
+If you want to add the "filename" parameter to the returned CDN link. Optional. Default false.
+Example Request
+Success
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/usenet/requestdl/batch?token=&usenet_id=&file_ids=&user_ip=&append_name='
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Usenet download links requested successfully.",
+  "data": [
+    "https://example.com/file1",
+    "https://example.com/file2"
+  ]
+}
+
+GETGet Usenet Cached Availability
+https://api.torbox.app/v1/api/usenet/checkcached?hash=&format=&list_files=
+Overview
+
+Takes in a list of comma separated usenet hashes and checks if the usenet download is cached. This endpoint only gets a max of around 100 at a time, due to http limits in queries. If you want to do more, you can simply do more hash queries. Such as:
+?hash=XXXX&hash=XXXX&hash=XXXX
+
+or ?hash=XXXX,XXXX&hash=XXXX&hash=XXXX,XXXX
+and this will work too. Performance is very fast. Less than 1 second per 100. Time is approximately O(log n) time for those interested in taking it to its max. That is without caching as well. This endpoint stores a cache for an hour.
+
+You may also pass a format parameter with the format you want the data in. Options are either object or list. You can view examples of both below.
+
+To get the hash of a usenet download, you can read this document for all of the strategies.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+hash
+
+The list of usenet hashes you want to check. Comma seperated. To find the hash, md5 the link of the usenet link or file.
+format
+
+Format you want the data in. Acceptable is either "object" or "list". List is the most performant option as it doesn't require modification of the list.
+list_files
+
+Allows you to list the files found inside the cached data. Optional.
+Example Request
+Success OBJECT
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/usenet/checkcached?hash=&format=object&list_files=false'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Usenet cache status retrieved successfully.",
+  "data": {
+    "string": {
+      "name": "string",
+      "size": 0,
+      "hash": "string"
+    }
+  }
+}
+
+POSTGet Usenet Cached Availability Batch
+https://api.torbox.app/v1/api/usenet/checkcached
+Overview
+
+Takes in a list of comma separated hashes and checks if the torrent is cached. With the POST endpoint you can submit a nearly unlimited hashes compared to the GET endpoint which is limited by url parameters.
+
+Performance is very fast. Less than 1 second per 100. Time is approximately O(log n) time for those interested in taking it to its max. That is without caching as well. This endpoint stores a cache for an hour.
+
+You may also pass a format parameter with the format you want the data in. Options are either object or list. You can view examples of both below.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+Bodyraw (json)
+json
+
+{
+    "hashes": [
+        "string"
+    ]
+}
+
+Example Request
+Get Torrent Cached Availability List With FIles Success
+View More
+curl
+
+curl --location -g 'https://api.torbox.app/v1/api/torrents/checkcached?hash={{torrent_hash}}&format=list&list_files=true'
+
+200 OK
+Example Response
+
+    Body
+    Headers (4)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Torrent cache status retrieved successfully.",
+  "data": [
+    {
+      "name": "XXXXXXXXXXXXXX",
+      "size": 0,
+      "hash": "XXXXXXXXXXXXXXXXXX",
+      "files": [
+        {
+          "name": "XXXXXXXXXXXXXXXXXX",
+          "size": 0
+        }
+      ]
+    },
+    {
+      "name": "XXXXXXXXXXXXXX",
+      "size": 0,
+      "hash": "XXXXXXXXXXXXXXXXXX",
+      "files": [
+        {
+          "name": "XXXXXXXXXXXXXXXXXX",
+          "size": 0
+        }
+      ]
+    }
+  ]
+}
+
+GETGet Web Download Cached Availability
+https://api.torbox.app/v1/api/webdl/checkcached?hash=&format=object&list_files=false
+Overview
+
+Takes in a list of comma separated usenet hashes and checks if the web download is cached. This endpoint only gets a max of around 100 at a time, due to http limits in queries. If you want to do more, you can simply do more hash queries. Such as:
+?hash=XXXX&hash=XXXX&hash=XXXX
+
+or ?hash=XXXX,XXXX&hash=XXXX&hash=XXXX,XXXX
+and this will work too. Performance is very fast. Less than 1 second per 100. Time is approximately O(log n) time for those interested in taking it to its max. That is without caching as well. This endpoint stores a cache for an hour.
+
+You may also pass a format parameter with the format you want the data in. Options are either object or list. You can view examples of both below.
+
+To get the hash of a web download you can read this document for all of the strategies.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+hash
+
+The list of web hashes you want to check. Comma seperated. To find the hash, md5 the link.
+format
+
+object
+
+Format you want the data in. Acceptable is either "object" or "list". List is the most performant option as it doesn't require modification of the list.
+list_files
+
+false
+
+Allows you to list the files found inside the cached data.
+Example Request
+Success OBJECT
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/webdl/checkcached?hash=&format=object&list_files=false'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Web download cache status retrieved successfully.",
+  "data": {
+    "string": {
+      "name": "string",
+      "size": 0,
+      "hash": "string"
+    }
+  }
+}
+
+POSTGet Web Download Cached Availability Batch
+https://api.torbox.app/v1/api/webdl/checkcached?format&list_files
+Overview
+
+Takes in a list of comma separated hashes and checks if the torrent is cached. With the POST endpoint you can submit a nearly unlimited hashes compared to the GET endpoint which is limited by url parameters.
+
+Performance is very fast. Less than 1 second per 100. Time is approximately O(log n) time for those interested in taking it to its max. That is without caching as well. This endpoint stores a cache for an hour.
+
+You may also pass a format parameter with the format you want the data in. Options are either object or list. You can view examples of both below.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+format
+
+Format you want the data in. Acceptable is either "object" or "list". List is the most performant option as it doesn't require modification of the list.
+list_files
+
+Allows you to list the files found inside the cached data.
+Bodyraw (json)
+json
+
+{
+    "hashes": [
+        "string"
+    ]
+}
+
+Example Request
+Success OBJECT
+curl
+
+curl --location 'https://api.torbox.app/v1/api/webdl/checkcached' \
+--data '{
+    "hashes": [
+        "string"
+    ]
+}'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Web download cache status retrieved successfully.",
+  "data": {
+    "string": {
+      "name": "string",
+      "size": 0,
+      "hash": "string"
+    }
+  }
+}
+
+General
+Overview
+
+These are the general endpoints for TorBox. They aren't mission critical, but if your app or service needs them, they are here.
+Authorization
+
+None needed.
+Endpoints
+
+    GET Get Up Status /
+
+    GET Get Stats /stats
+
+    GET Get Changelogs RSS Feed /changelogs/rss
+
+    GET Get Changelogs JSON /changelogs/json
+
+    GET Get Speedtest Files /speedtest
+
+AUTHORIZATIONBearer Token
+This folder is using Bearer Token from collectionMain API
+GETGet Up Status
+https://api.torbox.app
+Overview
+
+Simply gets if the TorBox API is available for use or not. Also might include information about downtimes.
+Authorization
+
+None needed.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+Example Request
+Success
+curl
+
+curl --location 'https://api.torbox.app'
+
+200 OK
+Example Response
+
+    Body
+    Headers (4)
+
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "API is up and running.",
+  "data": null
+}
+
+POSTControl RSS Feed
+https://api.torbox.app/v1/api/rss/controlrss
+Overview
+
+Controls an RSS Feed. By sending the RSS feed's ID and the type of operation you want to perform, it will perform said action on the RSS feed checker.
+
+Operations are either:
+
+    Update forces an update on the rss feed
+    Delete deletes the rss feed from your account permanently. This also deletes all associated RSS feed items. This does not remove queued items spawned from the RSS feed.
+    Pause pauses checking the rss feed on the scan interval
+    Resume resumes a paused rss feed
+
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+Token
+
+{{api_key}}
+Bodyraw (json)
+View More
+json
+
+{
+    "operation": "string", // The operation you want to perform on the RSS feed. Options are 'update', 'delete', 'resume' and 'pause'.
+    "rss_feed_id": 0 // The ID of the RSS feed you want to perform the operation on.
+}
+
+Example Request
+Success
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/rss/controlrss' \
+--data '{
+    "operation": "string", // The operation you want to perform on the RSS feed. Options are '\''update'\'', '\''delete'\'', '\''resume'\'' and '\''pause'\''.
+    "rss_feed_id": 0 // The ID of the RSS feed you want to perform the operation on.
+}'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "RSS Feed operationd successfully.",
+  "data": null
+}
+
+POSTEdit RSS Feed
+https://api.torbox.app/v1/api/rss/modifyrss
+Overview
+
+Allows you to edit the RSS feed based on the RSS feed ID passed. Allows you to change everything about an RSS feed, except for the URL.
+
+When updating the "rss_type" or the "torrent_seeding" options, it will update all of the RSS items associated with the RSS feed, including all previous items.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+Bodyraw (json)
+View More
+json
+
+{
+    "rss_feed_id": 0, // The ID of the RSS feed you want to modify.
+    "name": "string", // Display name of the rss feed you want to add.
+    "do_regex": "string", // Regex of items you want to make sure are added. Optional.
+    "dont_regex": "string", // Regex of items you dont want added. Optional.
+    "dont_older_than": 0, // Time in days that tells the parser to skip if the torrent is older than that many days. Optional.
+    "scan_interval": 0, // Time in minutes with the minimum being 10 which you want the api to scan in interval. Optional. Default is 60.
+    "pass_check": false, // Boolean which tells to allow multiple of the same url if it already exists on your account
+    "rss_type": "torrent", // The type of downloads inside of this RSS feed. Optional. Default is torrent. Options are "torrent", "usenet", "webdl"
+    "torrent_seeding": 1 // Determines if torrents inside of this RSS feed will seed or not. Optional. Default is 1, for auto. Options are 1 for auto, 2 for always, and 3 for never.
+}
+
+Example Request
+Success
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/rss/modifyrss' \
+--data '{
+    "rss_feed_id": 0, // The ID of the RSS feed you want to modify.
+    "name": "string", // Display name of the rss feed you want to add.
+    "do_regex": "string", // Regex of items you want to make sure are added. Optional.
+    "dont_regex": "string", // Regex of items you dont want added. Optional.
+    "dont_older_than": 0, // Time in days that tells the parser to skip if the torrent is older than that many days. Optional.
+    "scan_interval": 0, // Time in minutes with the minimum being 10 which you want the api to scan in interval. Optional. Default is 60.
+    "pass_check": false, // Boolean which tells to allow multiple of the same url if it already exists on your account
+    "rss_type": "torrent", // The type of downloads inside of this RSS feed. Optional. Default is torrent. Options are "torrent", "usenet", "webdl"
+    "torrent_seeding": 1 // Determines if torrents inside of this RSS feed will seed or not. Optional. Default is 1, for auto. Options are 1 for auto, 2 for always, and 3 for never.
+}'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "RSS feed modified successfully.",
+  "data": null
+}
+
+Stream
+Overview
+
+With the release of TorBox v8.1 we are introducing the ability to stream any video file directly in your browser, and this is fully powered by our API, which is available for developers to integrate into their apps. With minimal wait times for stream starts, low bandwidth streaming, and integrated subtitles and audio choosing, this API makes it simple to create a web player based off of a user's TorBox video files.
+Authorization
+
+For all requests, you will need your API token which can be found on your TorBox settings page under the API key section. Simply copy or refresh the API token and use it in the API.
+Endpoints /api/stream
+
+    GET Create Stream /createstream
+
+    GET Get Stream Data /getstreamdata
+
+AUTHORIZATIONBearer Token
+This folder is using Bearer Token from collectionMain API
+GETCreate Stream
+https://api.torbox.app/v1/api/stream/createstream?id=&file_id=0&type=torrent&chosen_subtitle_index=&chosen_audio_index=0&chosen_resolution_index
+Overview
+
+Creates a new stream based off of the data provided.
+Selecting Subtitles and Audios
+
+We use indexes to determine which audio and subtitle you would like to select. To view all available indexes, you must request this endpoint intially with "null" or 0, for the chosen indexes. This will return a metadata dictionary in the response, which will contain the list of audios and subtitles available for this stream. When choosing a subtitle or audio stream, use the relative index, starting from 0, rather than the "index" value. This is important for selecting the correct index. Once your user gets a selection of audios and subtitles available, you can submit this to the endpoint again to get the chosen stream.
+
+    null - Selecting no subtitle. Not available for audio as one must always be selected.
+
+    0 - Selecting first subtitle or audio
+
+Selecting Resolution
+
+Similar to the subtitles and audios, we use indexes to determine the resolution chosen. Unlike the above, these are predetermined. We do not upscale video, so if for example, you pass a 1080p video, and request it with resolution, 7, it will stay at 1080p. Please see the below for options.
+
+    null - Original video resolution. No downscaling will take place.
+
+    0 - 144p
+
+    1 - 240p
+
+    2 - 360p
+
+    3 - 480p
+
+    4 - 720p
+
+    5 - 1080p
+
+    6 - 1440p
+
+    7 - 2160p
+
+Types
+
+This endpoint allows you to handle torrents, usenet and web downloads all in one. This is why the "type" parameter is available. It defaults to "torrent".
+
+    torrent - Torrents
+
+    usenet - Usenet downloads
+
+    webdownload - Web Downloads
+
+Important Notes
+
+    Only text based subtitles are supported. If a non-text based subtitle is selected, it will be ignored.
+
+    If a subtitle or audio index does not exist on the stream, it will be ignored.
+
+    There are a lot of edge-case videos, if something doesn't work, don't hesitate to report the download hash and file_id of the failing video file.
+
+    This is a Pro only feature.
+
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+This request is using Bearer Token from collectionMain API
+PARAMS
+id
+
+The ID of the type of download.
+file_id
+
+0
+
+The file ID inside of the download you would like to stream.
+type
+
+torrent
+
+The type of download that this is. If choosing the incorrect one, the ID will be incorrect.
+chosen_subtitle_index
+
+The relative index of the subtitle you would like to stream. This is default null for none. 0 is the first subtitle found.
+chosen_audio_index
+
+0
+
+The relative index of the subtitle you would like to stream. Defaults to 0 for the first audio stream found inside the file. Cannot be null.
+chosen_resolution_index
+
+The index of the resolution you would like to stream. This is default null for original.
+Example Request
+Success
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/stream/createstream?id=&file_id=0&type=torrent&chosen_subtitle_index=&chosen_audio_index=0&chosen_resolution_index=null'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Stream initialized successfully.",
+  "data": {
+    "id": 0,
+    "file_id": 0,
+    "auth_id": "string",
+    "name": "string",
+    "short_name": "string",
+    "s3_path": "string",
+    "size": 0,
+    "mimetype": "string",
+    "hash": "string",
+    "open_subtitles_hash": "string",
+    "type": "torrent",
+    "region": "wnam",
+    "domain": "https://xxxx",
+    "user_token": "string",
+    "webdav_url": "https://xxxx",
+    "intro_information": {
+      "start_time": 0,
+      "end_time": 0,
+      "title": "string"
+    },
+    "scrobbling_enabled": true,
+    "hls_url": "https://xxxx",
+    "presigned_token": "string",
+    "subtitle_index": 0,
+    "audio_index": 0,
+    "resolution_index": 0,
+    "is_transcoding": false,
+    "needs_transcoding": true,
+    "metadata": {
+      "video": {
+        "index": 0,
+        "codec_type": "video",
+        "codec": "string",
+        "width": 0,
+        "height": 0,
+        "frame_rate": "0",
+        "pixel_format": "string",
+        "bitrate": "string",
+        "duration": "string",
+        "total_chunks": 0,
+        "file_name": "string",
+        "opensubtitles_hash": "string",
+        "size": 0,
+        "title": "string",
+        "title_data": {}
+      },
+      "audios": [
+        {
+          "index": 1,
+          "codec_type": "audio",
+          "codec": "string",
+          "default": true,
+          "sample_rate": "string",
+          "channels": 0,
+          "channel_layout": "string",
+          "language": "string",
+          "language_full": "string",
+          "title": "string"
+        }
+      ],
+      "subtitles": [],
+      "thumbnail": "thumbnail.png",
+      "chapters": "chapters.vtt"
+    },
+    "search_metadata": {
+      "title": "string",
+      "titles": [
+        "string",
+        "string"
+      ],
+      "keywords": [
+        "string",
+        "string"
+      ],
+      "genres": [
+        "string",
+        "string"
+      ],
+      "actors": [
+        "string",
+        "string"
+      ],
+      "releaseYears": "20XX-20XX",
+      "mediaType": "string",
+      "characters": [
+        "string",
+        "string"
+      ],
+      "globalID": "string",
+      "id": "string",
+      "link": "https://xxxx",
+      "description": "string",
+      "rating": 0,
+      "languages": [
+        "string",
+        "string"
+      ],
+      "contentRating": "string",
+      "trailer": {},
+      "image": "https://xxxx",
+      "isAdult": false,
+      "type": "string",
+      "releasedDate": "2000-01-27T00:00:00.000Z",
+      "episodesNumber": 0,
+      "runtime": "string",
+      "titles_full": [
+        {
+          "language": "string",
+          "title": "string"
+        }
+      ],
+      "backdrop": "https://xxxx"
+    }
+  }
+}
+
+GETGet Stream Data
+https://api.torbox.app/v1/api/stream/getstreamdata?presigned_token&token&chosen_subtitle_index&chosen_audio_index&chosen_resolution_index
+Overview
+
+Gets stream data from an already created stream. Requires the presigned token and user API token from the original request.
+Authorization
+
+Requires an API key using the Authorization Bearer Header.
+AUTHORIZATIONBearer Token
+Token
+
+{{api_key}}
+PARAMS
+presigned_token
+
+The presigned token given from the original, /createstream request.
+token
+
+The user's API token, can also be used from the original, /createstream request.
+chosen_subtitle_index
+
+The chosen subtitle index that you are requesting information about.
+chosen_audio_index
+
+The chosen audio index that you are requesting information about.
+chosen_resolution_index
+
+The index of the resolution you would like to stream. This is default null for original.
+Example Request
+Success
+View More
+curl
+
+curl --location 'https://api.torbox.app/v1/api/stream/getstreamdata?presigned_token=null&token=null&chosen_subtitle_index=null&chosen_audio_index=null&chosen_resolution_index=null'
+
+200 OK
+Example Response
+
+    Body
+    Headers (1)
+
+View More
+json
+
+{
+  "success": true,
+  "error": null,
+  "detail": "Stream initialized successfully.",
+  "data": {
+    "hls_url": "https://xxxx",
+    "domain": "https://xxxx",
+    "presigned_token": "string",
+    "subtitle_index": 0,
+    "audio_index": 0,
+    "resolution_index": 0,
+    "file_token": "string",
+    "token": "string",
+    "is_transcoding": false,
+    "needs_transcoding": true,
+    "metadata": {
+      "video": {
+        "index": 0,
+        "codec_type": "video",
+        "codec": "string",
+        "width": 0,
+        "height": 0,
+        "frame_rate": "0",
+        "pixel_format": "string",
+        "bitrate": "string",
+        "duration": "string",
+        "total_chunks": 0,
+        "file_name": "string",
+        "opensubtitles_hash": "string",
+        "size": 0,
+        "title": "string",
+        "title_data": {}
+      },
+      "audios": [
+        {
+          "index": 1,
+          "codec_type": "audio",
+          "codec": "string",
+          "default": true,
+          "sample_rate": "string",
+          "channels": 0,
+          "channel_layout": "string",
+          "language": "string",
+          "language_full": "string",
+          "title": "string"
+        }
+      ],
+      "subtitles": [],
+      "thumbnail": "thumbnail.png",
+      "chapters": "chapters.vtt"
+    },
+    "search_metadata": {
+      "title": "string",
+      "titles": [
+        "string",
+        "string"
+      ],
+      "keywords": [
+        "string",
+        "string"
+      ],
+      "genres": [
+        "string",
+        "string"
+      ],
+      "actors": [
+        "string",
+        "string"
+      ],
+      "releaseYears": "20XX-20XX",
+      "mediaType": "string",
+      "characters": [
+        "string",
+        "string"
+      ],
+      "globalID": "string",
+      "id": "string",
+      "link": "https://xxxx",
+      "description": "string",
+      "rating": 0,
+      "languages": [
+        "string",
+        "string"
+      ],
+      "contentRating": "string",
+      "trailer": {},
+      "image": "https://xxxx",
+      "isAdult": false,
+      "type": "string",
+      "releasedDate": "2000-01-27T00:00:00.000Z",
+      "episodesNumber": 0,
+      "runtime": "string",
+      "titles_full": [
+        {
+          "language": "string",
+          "title": "string"
+        }
+      ],
+      "backdrop": "https://xxxx"
+    }
+  }
+}
+

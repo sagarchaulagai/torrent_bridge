@@ -1,0 +1,727 @@
+
+
+O
+offcloud
+/API Documentation
+Dashboard
+Get Started
+Getting Started
+Authentication
+Error Handling
+Networks
+List Networks
+Create Network
+Get Network Details
+Nodes
+List Nodes
+Enroll Node
+Update Node
+Edge Servers
+List Domains
+Create Domain
+List Backends
+Create Backend
+Email Forwarding
+List Domains
+List Aliases
+Create Alias
+Webhooks
+Overview
+Event Types
+Payload Reference
+Headers
+Signature Verification
+API Documentation
+
+Build integrations with the offcloud API. Manage networks, nodes, and edge servers programmatically.
+Creating API Keys
+
+Create API keys in your dashboard under Settings → Access → New API Key.
+
+⚠️ Important: API keys are shown only once after creation. Store them securely in your environment variables.
+env
+
+OFFCLOUD_API_KEY=ock_live_xxxxxxxxxxxxxxxxxxx
+
+Authentication
+
+All API requests require authentication using a Bearer token in the Authorization header.
+Base URL
+https://api.offcloud.me/v1
+bash
+
+curl https://api.offcloud.me/v1/networks \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+Error Handling
+
+The API returns standard HTTP status codes and JSON error responses.
+200
+Success
+201
+Created
+400
+Bad Request (validation error)
+401
+Unauthorized (invalid/missing API key)
+403
+Forbidden (insufficient permissions)
+404
+Not Found
+500
+Internal Server Error
+json
+
+{
+  "detail": "Error message here"
+}
+
+Networks
+GET
+/networks
+
+List all networks for your organization
+Parameters
+org_id
+string— Filter by organization ID
+Response
+json
+
+[
+  {
+    "id": "uuid",
+    "name": "Home Network",
+    "org_id": "uuid",
+    "cidr_v4": "10.42.0.0/24",
+    "cidr_v6": null,
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z"
+  }
+]
+
+Example
+bash
+
+curl https://api.offcloud.me/v1/networks \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+POST
+/networks
+
+Create a new network
+Parameters
+org_id
+string
+required
+— Organization ID
+Request Body
+json
+
+{
+  "name": "My Network",
+  "cidr_v4": "10.42.0.0/24"
+}
+
+Response
+json
+
+{
+  "id": "uuid",
+  "name": "My Network",
+  "org_id": "uuid",
+  "cidr_v4": "10.42.0.0/24",
+  "created_at": "2026-01-06T19:00:00Z"
+}
+
+Example
+bash
+
+curl -X POST https://api.offcloud.me/v1/networks?org_id=YOUR_ORG_ID \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My Network"}'
+
+GET
+/networks/{network_id}
+
+Get details for a specific network
+Parameters
+network_id
+string
+required
+— Network UUID
+Response
+json
+
+{
+  "id": "uuid",
+  "name": "Home Network",
+  "org_id": "uuid",
+  "cidr_v4": "10.42.0.0/24",
+  "cidr_v6": null,
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+
+Example
+bash
+
+curl https://api.offcloud.me/v1/networks/NETWORK_ID \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+Nodes
+GET
+/networks/{network_id}/nodes
+
+List all nodes in a network
+Parameters
+network_id
+string
+required
+— Network UUID
+page
+integer— Page number (default: 1)
+page_size
+integer— Results per page (default: 25, max: 100)
+Response
+json
+
+{
+  "items": [
+    {
+      "id": "uuid",
+      "name": "laptop-001",
+      "status": "healthy",
+      "labels": ["laptop", "remote"],
+      "ips": ["10.42.0.1"],
+      "last_seen_at": "2026-01-06T19:00:00Z",
+      "alert_enabled": true
+    }
+  ],
+  "total": 10,
+  "page": 1,
+  "page_size": 25
+}
+
+Example
+bash
+
+curl https://api.offcloud.me/v1/networks/NETWORK_ID/nodes \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+POST
+/networks/{network_id}/nodes/enroll
+
+Enroll a new node in the network
+Parameters
+network_id
+string
+required
+— Network UUID
+auto_approve
+boolean— Auto-approve and allocate IP (default: false)
+generate_keypair
+boolean— Server generates WireGuard keys (default: false)
+Request Body
+json
+
+{
+  "node_name": "my-server",
+  "type": "simple",
+  "labels": ["production", "backend"],
+  "public_key": "base64-wg-public-key"
+}
+
+Response
+json
+
+{
+  "node_id": "uuid",
+  "token": "enrollment-token",
+  "expires_at": "2026-01-07T19:00:00Z",
+  "controller_url": "https://api.offcloud.me",
+  "network_id": "uuid",
+  "status": "approved",
+  "ipv4": "10.42.0.5",
+  "wg_config": {
+    "config": "[Interface]\n...",
+    "instructions": {}
+  }
+}
+
+Example
+bash
+
+curl -X POST "https://api.offcloud.me/v1/networks/NETWORK_ID/nodes/enroll?auto_approve=true&generate_keypair=true" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"node_name": "my-server", "type": "simple"}'
+
+PATCH
+/networks/{network_id}/nodes/{node_id}
+
+Update node settings
+Parameters
+network_id
+string
+required
+— Network UUID
+node_id
+string
+required
+— Node UUID
+Request Body
+json
+
+{
+  "alert_enabled": true,
+  "name": "new-name",
+  "labels": ["updated", "labels"]
+}
+
+Response
+json
+
+{
+  "id": "uuid",
+  "name": "new-name",
+  "status": "healthy",
+  "labels": ["updated", "labels"],
+  "alert_enabled": true
+}
+
+Example
+bash
+
+curl -X PATCH https://api.offcloud.me/v1/networks/NETWORK_ID/nodes/NODE_ID \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "new-name"}'
+
+Edge Servers
+GET
+/orgs/{org_id}/edges/domains
+
+List edge domains for your organization
+Parameters
+org_id
+string
+required
+— Organization UUID
+Response
+json
+
+[
+  {
+    "id": "uuid",
+    "fqdn": "app.example.com",
+    "org_id": "uuid",
+    "status": "active",
+    "dns_verification_record": "...",
+    "backend_count": 3,
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+]
+
+Example
+bash
+
+curl https://api.offcloud.me/v1/orgs/ORG_ID/edges/domains \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+POST
+/orgs/{org_id}/edges/domains
+
+Create a new edge domain
+Parameters
+org_id
+string
+required
+— Organization UUID
+Request Body
+json
+
+{
+  "fqdn": "app.example.com"
+}
+
+Response
+json
+
+{
+  "id": "uuid",
+  "fqdn": "app.example.com",
+  "org_id": "uuid",
+  "status": "pending_dns",
+  "dns_verification_record": "offcloud-verify=...",
+  "created_at": "2026-01-06T19:00:00Z"
+}
+
+Example
+bash
+
+curl -X POST https://api.offcloud.me/v1/orgs/ORG_ID/edges/domains \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"fqdn": "app.example.com"}'
+
+GET
+/edges/domains/{domain_id}/backends
+
+List backends for an edge domain
+Parameters
+domain_id
+string
+required
+— Domain UUID
+Response
+json
+
+[
+  {
+    "id": "uuid",
+    "node_id": "uuid",
+    "target_port": 8080,
+    "scheme": "http",
+    "enabled": true,
+    "health_status": "healthy",
+    "last_health_check": "2026-01-06T19:00:00Z"
+  }
+]
+
+Example
+bash
+
+curl https://api.offcloud.me/v1/edges/domains/DOMAIN_ID/backends \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+POST
+/edges/domains/{domain_id}/backends
+
+Create a new backend for an edge domain
+Parameters
+domain_id
+string
+required
+— Domain UUID
+Request Body
+json
+
+{
+  "node_id": "uuid",
+  "target_port": 8080,
+  "scheme": "http"
+}
+
+Response
+json
+
+{
+  "id": "uuid",
+  "node_id": "uuid",
+  "target_port": 8080,
+  "scheme": "http",
+  "enabled": true,
+  "health_status": "unknown",
+  "created_at": "2026-01-06T19:00:00Z"
+}
+
+Example
+bash
+
+curl -X POST https://api.offcloud.me/v1/edges/domains/DOMAIN_ID/backends \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": "NODE_ID", "target_port": 8080, "scheme": "http"}'
+
+Email Forwarding
+GET
+/smtp/domains
+
+List email domains
+Parameters
+org_id
+string— Filter by organization
+Response
+json
+
+[
+  {
+    "id": "uuid",
+    "domain": "example.com",
+    "status": "verified",
+    "org_id": "uuid",
+    "mx_records_required": ["mail.offcloud.me"],
+    "dns_verification_txt": "offcloud-smtp-verify=...",
+    "catch_all_enabled": false,
+    "created_at": "2026-01-01T00:00:00Z"
+  }
+]
+
+Example
+bash
+
+curl https://api.offcloud.me/v1/smtp/domains \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+GET
+/smtp/aliases
+
+List email aliases for a domain
+Parameters
+domain_id
+string
+required
+— Domain UUID
+Response
+json
+
+[
+  {
+    "id": "uuid",
+    "smtp_domain_id": "uuid",
+    "alias": "hello",
+    "full_email": "hello@example.com",
+    "enabled": true,
+    "forwards": [
+      {
+        "id": "uuid",
+        "forward_to": "user@gmail.com",
+        "verification_status": "verified",
+        "enabled": true
+      }
+    ]
+  }
+]
+
+Example
+bash
+
+curl "https://api.offcloud.me/v1/smtp/aliases?domain_id=DOMAIN_ID" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+POST
+/smtp/aliases
+
+Create a new email alias
+Parameters
+domain_id
+string
+required
+— Domain UUID
+Request Body
+json
+
+{
+  "alias": "support",
+  "forward_to": "team@company.com"
+}
+
+Response
+json
+
+{
+  "id": "uuid",
+  "smtp_domain_id": "uuid",
+  "alias": "support",
+  "full_email": "support@example.com",
+  "enabled": true,
+  "forwards": [
+    {
+      "id": "uuid",
+      "forward_to": "team@company.com",
+      "verification_status": "pending",
+      "enabled": true
+    }
+  ]
+}
+
+Example
+bash
+
+curl -X POST "https://api.offcloud.me/v1/smtp/aliases?domain_id=DOMAIN_ID" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"alias": "support", "forward_to": "team@company.com"}'
+
+Webhooks
+Overview
+
+Receive real-time notifications when events occur in your organization. Configure webhooks in Settings → Integrations → New Webhook.
+Payload Format
+json
+
+{
+  "event": "node.connected",
+  "timestamp": "2026-01-06T19:00:00Z",
+  "org_id": "uuid",
+  "data": {
+    "node_id": "uuid",
+    "node_name": "laptop-001",
+    "network_id": "uuid",
+    "network_name": "My Network",
+    "previous_status": "offline",
+    "new_status": "healthy",
+    "reason": "handshake_active"
+  }
+}
+
+Event Types
+Node Events
+node.enrolled
+New node enrolled
+node.connected
+Node came online
+node.disconnected
+Node went offline
+Network Events
+network.created
+New network created
+network.deleted
+Network deleted
+Edge Domain Events
+domain.created
+Edge domain created
+domain.validated
+DNS validation successful
+domain.failed
+DNS validation failed
+Event Payload Reference
+node.enrolled
+json
+
+{
+  "node_id": "uuid",
+  "node_name": "my-server",
+  "network_id": "uuid",
+  "network_name": "Production Network",
+  "node_type": "simple",
+  "status": "approved",
+  "ipv4": "10.42.0.5",
+  "auto_approved": true
+}
+
+node.connected
+json
+
+{
+  "node_id": "uuid",
+  "node_name": "laptop-001",
+  "network_id": "uuid",
+  "network_name": "Home Network",
+  "previous_status": "offline",
+  "new_status": "healthy",
+  "reason": "handshake_active"
+}
+
+node.disconnected
+json
+
+{
+  "node_id": "uuid",
+  "node_name": "laptop-001",
+  "network_id": "uuid",
+  "network_name": "Home Network",
+  "previous_status": "healthy",
+  "new_status": "offline",
+  "reason": "handshake_timeout"
+}
+
+network.created
+json
+
+{
+  "network_id": "uuid",
+  "network_name": "New Network",
+  "cidr_v4": "10.42.0.0/24"
+}
+
+network.deleted
+json
+
+{
+  "network_id": "uuid",
+  "network_name": "Old Network"
+}
+
+domain.created
+json
+
+{
+  "domain_id": "uuid",
+  "fqdn": "app.example.com",
+  "network_id": "uuid",
+  "status": "pending",
+  "tls_mode": "auto"
+}
+
+domain.validated
+json
+
+{
+  "domain_id": "uuid",
+  "fqdn": "app.example.com",
+  "network_id": "uuid",
+  "status": "active",
+  "previous_status": "pending",
+  "error": null
+}
+
+domain.failed
+json
+
+{
+  "domain_id": "uuid",
+  "fqdn": "app.example.com",
+  "network_id": "uuid",
+  "status": "error",
+  "previous_status": "pending",
+  "error": "DNS validation failed. Please add the required TXT record."
+}
+
+Webhook Headers
+
+Every webhook request includes these headers:
+X-Offcloud-Signature
+Signature for verification (format: t=timestamp,v1=hash)
+X-Offcloud-Event
+The event type (e.g., node.connected)
+X-Offcloud-Delivery
+Unique delivery ID (UUID)
+Content-Type
+application/json
+User-Agent
+Offcloud-Webhooks/1.0
+Signature Verification
+
+Every webhook request includes a signature header for verification:
+text
+
+X-Offcloud-Signature: t=1234567890,v1=sha256-hash
+
+Verification Example (Node.js)
+javascript
+
+const crypto = require('crypto');
+
+function verifySignature(payload, signature, secret) {
+  const parts = signature.split(',');
+  const timestamp = parts[0].split('=')[1];
+  const hash = parts[1].split('=')[1];
+  
+  const signedPayload = `${timestamp}.${payload}`;
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(signedPayload)
+    .digest('hex');
+  
+  return crypto.timingSafeEqual(
+    Buffer.from(hash),
+    Buffer.from(expected)
+  );
+}
+
+Need help? Contact support
+Home
+Articles
+Sign Up

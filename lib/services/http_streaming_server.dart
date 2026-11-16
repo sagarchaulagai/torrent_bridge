@@ -6,9 +6,11 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:libtorrent_flutter/libtorrent_flutter.dart';
 
+import '../models/debrid_models.dart';
 import '../models/streaming_models.dart';
 import 'android_foreground_service.dart';
 import 'audio_disk_cache_service.dart';
+import 'debrid_service.dart';
 import 'server_settings_service.dart';
 import 'torrent_engine_service.dart';
 
@@ -34,7 +36,8 @@ class HttpStreamingServer extends ChangeNotifier {
   String _localIp = '127.0.0.1';
   DateTime? _startedAt;
   String? _lastError;
-  String _authToken = ''; // Optional authorization token (empty = allow all local clients)
+  String _authToken =
+      ''; // Optional authorization token (empty = allow all local clients)
 
   int _sessionCounter = 0;
   int _clientCounter = 0;
@@ -53,6 +56,12 @@ class HttpStreamingServer extends ChangeNotifier {
   final List<String> _activityLogs = [];
 
   Timer? _notificationSyncTimer;
+
+  @visibleForTesting
+  DebridService debridService = DebridService.instance;
+
+  @visibleForTesting
+  bool skipTorrentEngineInit = false;
 
   bool get isRunning => _httpServer != null;
   bool get isStarting => _isStarting;
@@ -148,7 +157,18 @@ class HttpStreamingServer extends ChangeNotifier {
 
     try {
       // 1. Initialize the native libtorrent_flutter engine
-      await TorrentEngineService.instance.ensureInitialized();
+      if (!skipTorrentEngineInit) {
+        try {
+          await TorrentEngineService.instance.ensureInitialized();
+        } catch (e) {
+          if (!ServerSettingsService.instance.hasConfiguredDebrid) {
+            rethrow;
+          }
+          _log(
+            'Native torrent engine unavailable ($e); continuing in Debrid-only mode.',
+          );
+        }
+      }
 
       // 2. Discover local IP address
       _localIp = await resolveLocalIpv4();
@@ -173,7 +193,9 @@ class HttpStreamingServer extends ChangeNotifier {
       _startedAt = DateTime.now();
 
       if (_portFallbackUsed) {
-        _log('Warning: Port $targetPort was busy, bound to fallback port $_port instead.');
+        _log(
+          'Warning: Port $targetPort was busy, bound to fallback port $_port instead.',
+        );
       }
 
       _httpServer!.listen(
@@ -198,7 +220,9 @@ class HttpStreamingServer extends ChangeNotifier {
       );
 
       unawaited(ServerSettingsService.instance.setKeepServerRunning(true));
-      _log('Server started on http://$_localIp:$_port (loopback http://127.0.0.1:$_port)');
+      _log(
+        'Server started on http://$_localIp:$_port (loopback http://127.0.0.1:$_port)',
+      );
     } catch (e) {
       _lastError = e.toString();
       _log('Failed to start server: $e');
@@ -228,10 +252,10 @@ class HttpStreamingServer extends ChangeNotifier {
     if (_maintenanceTickCounter % 3 == 0 && _sessions.isNotEmpty) {
       unawaited(
         ServerSettingsService.instance.checkAndEnforceCacheLimit(
-          protectedInfoHashes:
-              _sessions.values.map((s) => s.infoHash).toSet(),
-          protectedRelativePaths:
-              _sessions.values.map((s) => s.filePath).toSet(),
+          protectedInfoHashes: _sessions.values.map((s) => s.infoHash).toSet(),
+          protectedRelativePaths: _sessions.values
+              .map((s) => s.filePath)
+              .toSet(),
         ),
       );
     }
@@ -297,7 +321,9 @@ class HttpStreamingServer extends ChangeNotifier {
     String? filePath,
     int? fileIndex,
   }) async {
-    final normalizedHash = TorrentEngineService.extractInfoHash(magnetOrInfoHash);
+    final normalizedHash = TorrentEngineService.extractInfoHash(
+      magnetOrInfoHash,
+    );
     final pendingKey = '$normalizedHash|${filePath ?? ""}|${fileIndex ?? -1}';
     final existingFuture = _pendingSessions[pendingKey];
     if (existingFuture != null) {
@@ -326,18 +352,25 @@ class HttpStreamingServer extends ChangeNotifier {
       await startServer(port: ServerSettingsService.instance.serverPort);
     }
 
-    final normalizedHash = TorrentEngineService.extractInfoHash(magnetOrInfoHash);
-    final magnetUri = TorrentEngineService.normalizeToMagnetUri(magnetOrInfoHash);
+    final normalizedHash = TorrentEngineService.extractInfoHash(
+      magnetOrInfoHash,
+    );
+    final magnetUri = TorrentEngineService.normalizeToMagnetUri(
+      magnetOrInfoHash,
+    );
     final cacheSvc = AudioDiskCacheService.instance;
+    final settings = ServerSettingsService.instance;
 
     // Fast path: if the full file is already cached on disk (e.g. after app
-    // restart), serve immediately without waiting for torrent peers or metadata.
+    // restart), serve immediately without waiting for torrent peers or Debrid.
     final cachedEntry = cacheSvc.findMatchingEntry(
       infoHash: normalizedHash,
       fileIndex: fileIndex,
       filePath: filePath,
     );
-    if (cachedEntry != null && cachedEntry.isComplete && cachedEntry.fileSize > 0) {
+    if (cachedEntry != null &&
+        cachedEntry.isComplete &&
+        cachedEntry.fileSize > 0) {
       for (final existing in _sessions.values) {
         if (existing.infoHash == cachedEntry.infoHash &&
             existing.fileIndex == cachedEntry.fileIndex) {
@@ -405,6 +438,125 @@ class HttpStreamingServer extends ChangeNotifier {
       return session;
     }
 
+    // Debrid-first path when user has configured a Debrid provider + API key
+    if (settings.hasConfiguredDebrid) {
+      final activeProvider = settings.debridProvider;
+      final activeKey = settings.activeDebridApiKey;
+
+      for (final existing in _sessions.values) {
+        if (existing.isDebridStream &&
+            existing.debridProvider == activeProvider.id &&
+            existing.infoHash == normalizedHash &&
+            (fileIndex == null || existing.fileIndex == fileIndex) &&
+            (filePath == null ||
+                existing.filePath.toLowerCase() ==
+                    filePath.trim().toLowerCase() ||
+                existing.fileName.toLowerCase() ==
+                    filePath.trim().toLowerCase())) {
+          existing.lastAccessedAt = DateTime.now();
+          for (final s in _sessions.values) {
+            s.isPrimary = (s.sessionId == existing.sessionId);
+          }
+          _log(
+            'Reusing Debrid (${activeProvider.displayName}) session ${existing.sessionId} for "${existing.fileName}"',
+          );
+          notifyListeners();
+          return existing;
+        }
+      }
+
+      try {
+        _log(
+          'Resolving audio via ${activeProvider.displayName} for ${normalizedHash.substring(0, math.min(8, normalizedHash.length))}...',
+        );
+        final resolved = await debridService.resolveAudioFile(
+          provider: activeProvider,
+          apiKey: activeKey,
+          magnetOrInfoHash: magnetUri,
+          filePath: filePath,
+          fileIndex: fileIndex,
+        );
+
+        DiskCacheEntry? diskEntry;
+        if (cacheSvc.isInitialized && resolved.fileSize > 0) {
+          diskEntry = await cacheSvc.ensureEntry(
+            infoHash: resolved.infoHash,
+            fileIndex: resolved.fileIndex,
+            fileName: resolved.fileName,
+            filePath: resolved.filePath,
+            mimeType: resolved.mimeType,
+            fileSize: resolved.fileSize,
+          );
+        }
+
+        _sessionCounter++;
+        final shortHash = resolved.infoHash.substring(
+          0,
+          math.min(8, resolved.infoHash.length),
+        );
+        final sessionId =
+            's${_sessionCounter}_debrid_${activeProvider.id}_${shortHash}_${resolved.fileIndex}';
+
+        for (final s in _sessions.values) {
+          s.isPrimary = false;
+        }
+
+        final session = StreamingSession(
+          sessionId: sessionId,
+          torrentId: -1,
+          nativeStreamId: -1,
+          magnetUri: magnetUri,
+          infoHash: resolved.infoHash,
+          torrentName: '${activeProvider.displayName} • ${resolved.fileName}',
+          fileIndex: resolved.fileIndex,
+          fileName: resolved.fileName,
+          filePath: resolved.filePath,
+          fileSize: resolved.fileSize,
+          mimeType: resolved.mimeType,
+          formatLabel: resolved.formatLabel,
+          nativeStreamUrl: '',
+          createdAt: DateTime.now(),
+          isDebridStream: true,
+          debridProvider: activeProvider.id,
+          debridDirectUrl: resolved.directUrl,
+          isPrimary: true,
+          isCached: diskEntry?.isComplete ?? false,
+          cachedBytes: diskEntry?.cachedBytes ?? 0,
+          cachedPercentage: diskEntry?.cachedPercentage ?? 0.0,
+          lastAccessedAt: DateTime.now(),
+        );
+
+        _sessions[sessionId] = session;
+        _lastError = null;
+        ServerSettingsService.instance.recordAccess(resolved.infoHash);
+        _log(
+          'Created Debrid (${activeProvider.displayName}) stream session $sessionId -> ${resolved.fileName}',
+        );
+        _syncForegroundNotification();
+        notifyListeners();
+        return session;
+      } catch (e) {
+        final baseMessage = e is DebridException
+            ? e.toString()
+            : 'Debrid (${activeProvider.displayName}) failed: $e';
+        _log(baseMessage);
+        if (!settings.fallbackToTorrentOnDebridFailure) {
+          final userMessage =
+              '$baseMessage. Enable "Try Torrenting if Debrid Fails" in Settings to fall back to P2P torrenting.';
+          _lastError = userMessage;
+          notifyListeners();
+          throw DebridException(
+            userMessage,
+            statusCode: e is DebridException ? e.statusCode : null,
+            provider: activeProvider,
+          );
+        }
+        _log(
+          'Debrid fallback to P2P torrent is ON; switching to torrent engine...',
+        );
+      }
+    }
+
     final engineSvc = TorrentEngineService.instance;
     final torrentId = await engineSvc.addOrGetTorrent(
       magnetOrInfoHash,
@@ -430,7 +582,10 @@ class HttpStreamingServer extends ChangeNotifier {
           existing.latestNativeInfo = nativeStreams[existing.nativeStreamId];
           existing.lastAccessedAt = DateTime.now();
 
-          final diskEntry = cacheSvc.getEntry(existing.infoHash, existing.fileIndex);
+          final diskEntry = cacheSvc.getEntry(
+            existing.infoHash,
+            existing.fileIndex,
+          );
           if (diskEntry != null) {
             existing.isCached = diskEntry.isComplete;
             existing.cachedBytes = diskEntry.cachedBytes;
@@ -609,11 +764,10 @@ class HttpStreamingServer extends ChangeNotifier {
     }
 
     if (!_isAuthorized(req)) {
-      await _sendJson(
-        req.response,
-        HttpStatus.unauthorized,
-        {'error': 'Unauthorized client. Provide valid X-Auth-Token or Bearer token.'},
-      );
+      await _sendJson(req.response, HttpStatus.unauthorized, {
+        'error':
+            'Unauthorized client. Provide valid X-Auth-Token or Bearer token.',
+      });
       return;
     }
 
@@ -717,6 +871,14 @@ class HttpStreamingServer extends ChangeNotifier {
       await _sendJson(req.response, HttpStatus.notFound, {
         'error': 'Endpoint not found: ${req.method} $path',
       });
+    } on DebridException catch (e) {
+      _log('Debrid error on ${req.method} $path: ${e.message}');
+      try {
+        await _sendJson(req.response, HttpStatus.badGateway, {
+          'error': e.message,
+          'provider': e.provider?.id,
+        });
+      } catch (_) {}
     } catch (e) {
       _log('Error handling ${req.method} $path: $e');
       try {
@@ -747,7 +909,9 @@ class HttpStreamingServer extends ChangeNotifier {
       'started_at': _startedAt?.toIso8601String(),
       'libtorrent_version': engineSvc.libraryVersion,
       'connected_clients_count': _activeClients.length,
-      'connected_clients': _activeClients.values.map((c) => c.toJson()).toList(),
+      'connected_clients': _activeClients.values
+          .map((c) => c.toJson())
+          .toList(),
       'active_sessions_count': _sessions.length,
       'active_sessions': _sessions.values
           .map((s) => s.toJson(host: host, port: _port))
@@ -836,8 +1000,9 @@ class HttpStreamingServer extends ChangeNotifier {
       return;
     }
 
-    final magnetOrHash =
-        (payload['magnet'] ?? payload['infohash'])?.toString().trim();
+    final magnetOrHash = (payload['magnet'] ?? payload['infohash'])
+        ?.toString()
+        .trim();
     if (magnetOrHash == null || magnetOrHash.isEmpty) {
       await _sendJson(req.response, HttpStatus.badRequest, {
         'error': 'Missing "magnet" or "infohash".',
@@ -904,19 +1069,41 @@ class HttpStreamingServer extends ChangeNotifier {
     try {
       final json = jsonDecode(bodyStr) as Map<String, dynamic>;
       if (json['max_cache_size_bytes'] is num) {
-        await settings.setMaxCacheSizeBytes((json['max_cache_size_bytes'] as num).toInt());
+        await settings.setMaxCacheSizeBytes(
+          (json['max_cache_size_bytes'] as num).toInt(),
+        );
       } else if (json['max_cache_size_mb'] is num) {
-        await settings.setMaxCacheSizeBytes((json['max_cache_size_mb'] as num).toInt() * 1024 * 1024);
+        await settings.setMaxCacheSizeBytes(
+          (json['max_cache_size_mb'] as num).toInt() * 1024 * 1024,
+        );
       }
 
       if (json['prioritize_newest'] is bool) {
         await settings.setPrioritizeNewest(json['prioritize_newest'] as bool);
       }
       if (json['auto_pause_background'] is bool) {
-        await settings.setAutoPauseBackground(json['auto_pause_background'] as bool);
+        await settings.setAutoPauseBackground(
+          json['auto_pause_background'] as bool,
+        );
       }
       if (json['fast_audio_preload'] is bool) {
         await settings.setFastAudioPreload(json['fast_audio_preload'] as bool);
+      }
+      if (json['debrid_provider'] is String) {
+        await settings.setDebridProvider(
+          DebridProvider.fromId(json['debrid_provider'] as String),
+        );
+      }
+      if (json['debrid_api_key'] is String) {
+        await settings.setDebridApiKey(
+          settings.debridProvider,
+          json['debrid_api_key'] as String,
+        );
+      }
+      if (json['fallback_to_torrent_on_debrid_failure'] is bool) {
+        await settings.setFallbackToTorrentOnDebridFailure(
+          json['fallback_to_torrent_on_debrid_failure'] as bool,
+        );
       }
 
       await _sendJson(req.response, HttpStatus.ok, {
@@ -975,7 +1162,8 @@ class HttpStreamingServer extends ChangeNotifier {
   ) async {
     final rangeHeader = req.headers.value(HttpHeaders.rangeHeader);
     final remoteAddr = req.connectionInfo?.remoteAddress.address ?? '127.0.0.1';
-    final userAgent = req.headers.value(HttpHeaders.userAgentHeader) ?? 'AudioPlayer';
+    final userAgent =
+        req.headers.value(HttpHeaders.userAgentHeader) ?? 'AudioPlayer';
 
     _clientCounter++;
     final clientId = 'c$_clientCounter';
@@ -1008,7 +1196,9 @@ class HttpStreamingServer extends ChangeNotifier {
         session.infoHash,
         session.fileIndex,
       );
-      if (cacheEntry == null && cacheSvc.isInitialized && session.fileSize > 0) {
+      if (cacheEntry == null &&
+          cacheSvc.isInitialized &&
+          session.fileSize > 0) {
         cacheEntry = await cacheSvc.ensureEntry(
           infoHash: session.infoHash,
           fileIndex: session.fileIndex,
@@ -1033,33 +1223,44 @@ class HttpStreamingServer extends ChangeNotifier {
 
         if (parsed != null) {
           final totalToSend = parsed.end - parsed.start + 1;
-          final isFullCacheHit = cacheEntry != null &&
+          final isFullCacheHit =
+              cacheEntry != null &&
               cacheEntry.isRangeCached(parsed.start, parsed.end);
 
           _log(
             '${req.method} /stream/${session.sessionId} from $remoteAddr '
-            '(${rangeHeader ?? "full file"}) ${isFullCacheHit ? "[DISK CACHE HIT]" : "[TORRENT/HYBRID]"}',
+            '(${rangeHeader ?? "full file"}) ${isFullCacheHit ? "[DISK CACHE HIT]" : (session.isDebridStream ? "[DEBRID/HYBRID]" : "[TORRENT/HYBRID]")}',
           );
 
-          res.statusCode =
-              parsed.isPartial ? HttpStatus.partialContent : HttpStatus.ok;
-          res.headers.set(HttpHeaders.contentTypeHeader, session.mimeType);
-          res.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-          res.headers.set(HttpHeaders.cacheControlHeader, 'no-store, no-cache');
-          res.headers.set(HttpHeaders.connectionHeader, 'close');
-          res.headers.set(
-            HttpHeaders.etagHeader,
-            '"${session.infoHash}-${session.fileIndex}"',
-          );
-          if (parsed.isPartial) {
+          var headersCommitted = false;
+          void commitHeaders() {
+            if (headersCommitted) return;
+            headersCommitted = true;
+            res.statusCode = parsed.isPartial
+                ? HttpStatus.partialContent
+                : HttpStatus.ok;
+            res.headers.set(HttpHeaders.contentTypeHeader, session.mimeType);
+            res.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
             res.headers.set(
-              HttpHeaders.contentRangeHeader,
-              'bytes ${parsed.start}-${parsed.end}/${session.fileSize}',
+              HttpHeaders.cacheControlHeader,
+              'no-store, no-cache',
             );
+            res.headers.set(HttpHeaders.connectionHeader, 'close');
+            res.headers.set(
+              HttpHeaders.etagHeader,
+              '"${session.infoHash}-${session.fileIndex}"',
+            );
+            if (parsed.isPartial) {
+              res.headers.set(
+                HttpHeaders.contentRangeHeader,
+                'bytes ${parsed.start}-${parsed.end}/${session.fileSize}',
+              );
+            }
+            res.contentLength = totalToSend;
           }
-          res.contentLength = totalToSend;
 
           if (req.method == 'HEAD') {
+            commitHeaders();
             if (cacheEntry != null) {
               cacheSvc.recordAccess(cacheEntry.key);
             }
@@ -1070,125 +1271,136 @@ class HttpStreamingServer extends ChangeNotifier {
           var currentOffset = parsed.start;
           var anyMissDownloaded = false;
 
-          while (currentOffset <= parsed.end) {
-            final covering = cacheEntry?.findCoveringRange(currentOffset);
-            if (covering != null && cacheEntry != null) {
-              final segEnd = math.min(covering.end, parsed.end);
-              await for (final chunk in cacheSvc.openCachedRangeStream(
-                cacheEntry.key,
-                currentOffset,
-                segEnd,
-              )) {
-                res.add(chunk);
-                clientInfo.bytesTransferred += chunk.length;
-                session.bytesServed += chunk.length;
-              }
-              currentOffset = segEnd + 1;
-              continue;
-            }
-
-            // Cache miss for currentOffset..segEnd: fetch only up to next cached hole
-            final nextCached = cacheEntry?.findNextCachedRangeAfter(currentOffset);
-            final segEnd = nextCached != null
-                ? math.min(nextCached.start - 1, parsed.end)
-                : parsed.end;
-
-            await _ensureNativeStreamActive(session);
-            final upstreamClient = _getUpstreamClient();
-            final upstreamUri = Uri.parse(session.nativeStreamUrl);
-            final upstreamReq = await upstreamClient.openUrl('GET', upstreamUri);
-            upstreamReq.followRedirects = false;
-            upstreamReq.headers.set(
-              HttpHeaders.rangeHeader,
-              'bytes=$currentOffset-$segEnd',
-            );
-
-            final upstreamRes = await upstreamReq.close();
-            if (upstreamRes.statusCode >= 400) {
-              throw HttpException(
-                'Torrent engine returned HTTP ${upstreamRes.statusCode} for range $currentOffset-$segEnd',
-              );
-            }
-
-            if (cacheEntry == null && cacheSvc.isInitialized) {
-              cacheEntry = await cacheSvc.ensureEntry(
-                infoHash: session.infoHash,
-                fileIndex: session.fileIndex,
-                fileName: session.fileName,
-                filePath: session.filePath,
-                mimeType: session.mimeType,
-                fileSize: session.fileSize,
-              );
-            }
-
-            var upstreamPos = _resolveUpstreamStartOffset(
-              upstreamRes,
-              fallbackStart: currentOffset,
-            );
-            anyMissDownloaded = true;
-
-            if (cacheEntry != null) {
-              cacheSvc.acquireWriteLock(cacheEntry.key);
-            }
-            try {
-              await for (final chunk in upstreamRes) {
-                if (chunk.isEmpty) continue;
-                final chunkStart = upstreamPos;
-                final chunkEnd = upstreamPos + chunk.length - 1;
-                upstreamPos += chunk.length;
-
-                // Slice if upstream returned bytes outside [currentOffset, segEnd]
-                if (chunkEnd < currentOffset) continue;
-                if (chunkStart > segEnd) break;
-
-                final sliceStart = math.max(0, currentOffset - chunkStart);
-                final sliceEndExclusive = math.min(
-                  chunk.length,
-                  segEnd - chunkStart + 1,
-                );
-                if (sliceEndExclusive <= sliceStart) continue;
-
-                final effectiveChunk =
-                    (sliceStart == 0 && sliceEndExclusive == chunk.length)
-                        ? chunk
-                        : chunk.sublist(sliceStart, sliceEndExclusive);
-                final writeOffset = chunkStart + sliceStart;
-
-                if (cacheEntry != null) {
-                  await cacheSvc.writeChunk(
-                    cacheEntry.key,
-                    writeOffset,
-                    effectiveChunk,
-                    totalFileSize: session.fileSize,
-                  );
+          try {
+            while (currentOffset <= parsed.end) {
+              final covering = cacheEntry?.findCoveringRange(currentOffset);
+              if (covering != null && cacheEntry != null) {
+                commitHeaders();
+                final segEnd = math.min(covering.end, parsed.end);
+                await for (final chunk in cacheSvc.openCachedRangeStream(
+                  cacheEntry.key,
+                  currentOffset,
+                  segEnd,
+                )) {
+                  res.add(chunk);
+                  clientInfo.bytesTransferred += chunk.length;
+                  session.bytesServed += chunk.length;
                 }
-
-                res.add(effectiveChunk);
-                clientInfo.bytesTransferred += effectiveChunk.length;
-                session.bytesServed += effectiveChunk.length;
+                currentOffset = segEnd + 1;
+                continue;
               }
-            } finally {
+
+              // Cache miss for currentOffset..segEnd: fetch only up to next cached hole
+              final nextCached = cacheEntry?.findNextCachedRangeAfter(
+                currentOffset,
+              );
+              final segEnd = nextCached != null
+                  ? math.min(nextCached.start - 1, parsed.end)
+                  : parsed.end;
+
+              final upstreamRes = await _openUpstreamResponse(
+                session,
+                method: 'GET',
+                rangeHeader: 'bytes=$currentOffset-$segEnd',
+              );
+
+              commitHeaders();
+
+              if (cacheEntry == null && cacheSvc.isInitialized) {
+                cacheEntry = await cacheSvc.ensureEntry(
+                  infoHash: session.infoHash,
+                  fileIndex: session.fileIndex,
+                  fileName: session.fileName,
+                  filePath: session.filePath,
+                  mimeType: session.mimeType,
+                  fileSize: session.fileSize,
+                );
+              }
+
+              var upstreamPos = _resolveUpstreamStartOffset(
+                upstreamRes,
+                fallbackStart: currentOffset,
+              );
+              anyMissDownloaded = true;
+
               if (cacheEntry != null) {
-                await cacheSvc.releaseWriteLock(cacheEntry.key);
-                session.cachedBytes = cacheEntry.cachedBytes;
-                session.cachedPercentage = cacheEntry.cachedPercentage;
-                session.isCached = cacheEntry.isComplete;
+                cacheSvc.acquireWriteLock(cacheEntry.key);
               }
-            }
+              try {
+                await for (final chunk in upstreamRes) {
+                  if (chunk.isEmpty) continue;
+                  final chunkStart = upstreamPos;
+                  final chunkEnd = upstreamPos + chunk.length - 1;
+                  upstreamPos += chunk.length;
 
-            currentOffset = segEnd + 1;
+                  // Slice if upstream returned bytes outside [currentOffset, segEnd]
+                  if (chunkEnd < currentOffset) continue;
+                  if (chunkStart > segEnd) break;
+
+                  final sliceStart = math.max(0, currentOffset - chunkStart);
+                  final sliceEndExclusive = math.min(
+                    chunk.length,
+                    segEnd - chunkStart + 1,
+                  );
+                  if (sliceEndExclusive <= sliceStart) continue;
+
+                  final effectiveChunk =
+                      (sliceStart == 0 && sliceEndExclusive == chunk.length)
+                      ? chunk
+                      : chunk.sublist(sliceStart, sliceEndExclusive);
+                  final writeOffset = chunkStart + sliceStart;
+
+                  if (cacheEntry != null) {
+                    await cacheSvc.writeChunk(
+                      cacheEntry.key,
+                      writeOffset,
+                      effectiveChunk,
+                      totalFileSize: session.fileSize,
+                    );
+                  }
+
+                  res.add(effectiveChunk);
+                  clientInfo.bytesTransferred += effectiveChunk.length;
+                  session.bytesServed += effectiveChunk.length;
+                }
+              } finally {
+                if (cacheEntry != null) {
+                  await cacheSvc.releaseWriteLock(cacheEntry.key);
+                  session.cachedBytes = cacheEntry.cachedBytes;
+                  session.cachedPercentage = cacheEntry.cachedPercentage;
+                  session.isCached = cacheEntry.isComplete;
+                }
+              }
+
+              currentOffset = segEnd + 1;
+            }
+          } on DebridException catch (e) {
+            _lastError = e.message;
+            _log('Debrid upstream failed: ${e.message}');
+            notifyListeners();
+            if (!headersCommitted) {
+              await _sendJson(res, HttpStatus.badGateway, {
+                'error': e.message,
+                'provider': e.provider?.id,
+              });
+              return;
+            }
+            rethrow;
           }
 
+          commitHeaders();
           await res.flush();
           await res.close();
 
           if (anyMissDownloaded) {
             unawaited(
               ServerSettingsService.instance.checkAndEnforceCacheLimit(
-                protectedInfoHashes:
-                    _sessions.values.map((s) => s.infoHash).toSet(),
-                protectedRelativePaths:
-                    _sessions.values.map((s) => s.filePath).toSet(),
+                protectedInfoHashes: _sessions.values
+                    .map((s) => s.infoHash)
+                    .toSet(),
+                protectedRelativePaths: _sessions.values
+                    .map((s) => s.filePath)
+                    .toSet(),
               ),
             );
           }
@@ -1199,23 +1411,31 @@ class HttpStreamingServer extends ChangeNotifier {
       // Fallback when total fileSize is not yet known before upstream responds
       _log(
         '${req.method} /stream/${session.sessionId} from $remoteAddr '
-        '(${rangeHeader ?? "full file"}) [UNKNOWN SIZE PROXY]',
+        '(${rangeHeader ?? "full file"}) ${session.isDebridStream ? "[DEBRID UNKNOWN SIZE]" : "[UNKNOWN SIZE PROXY]"}',
       );
-      await _ensureNativeStreamActive(session);
-      final upstreamClient = _getUpstreamClient();
-      final upstreamUri = Uri.parse(session.nativeStreamUrl);
-      final upstreamReq = await upstreamClient.openUrl(req.method, upstreamUri);
-      upstreamReq.followRedirects = false;
 
-      if (rangeHeader != null && rangeHeader.isNotEmpty) {
-        final normalizedRange = _normalizeRangeHeader(
-          rangeHeader,
-          session.fileSize,
+      final String? normalizedRange =
+          (rangeHeader != null && rangeHeader.isNotEmpty)
+          ? _normalizeRangeHeader(rangeHeader, session.fileSize)
+          : null;
+
+      final HttpClientResponse upstreamRes;
+      try {
+        upstreamRes = await _openUpstreamResponse(
+          session,
+          method: req.method,
+          rangeHeader: normalizedRange,
         );
-        upstreamReq.headers.set(HttpHeaders.rangeHeader, normalizedRange);
+      } on DebridException catch (e) {
+        _lastError = e.message;
+        _log('Debrid upstream failed: ${e.message}');
+        notifyListeners();
+        await _sendJson(res, HttpStatus.badGateway, {
+          'error': e.message,
+          'provider': e.provider?.id,
+        });
+        return;
       }
-
-      final upstreamRes = await upstreamReq.close();
 
       // Update fileSize on session if discovered from Content-Length / Content-Range
       if (session.fileSize <= 0 &&
@@ -1260,7 +1480,9 @@ class HttpStreamingServer extends ChangeNotifier {
         return;
       }
 
-      if (cacheEntry == null && cacheSvc.isInitialized && session.fileSize > 0) {
+      if (cacheEntry == null &&
+          cacheSvc.isInitialized &&
+          session.fileSize > 0) {
         cacheEntry = await cacheSvc.ensureEntry(
           infoHash: session.infoHash,
           fileIndex: session.fileIndex,
@@ -1319,14 +1541,118 @@ class HttpStreamingServer extends ChangeNotifier {
     }
   }
 
+  Future<HttpClientResponse> _openUpstreamResponse(
+    StreamingSession session, {
+    required String method,
+    String? rangeHeader,
+  }) async {
+    Future<HttpClientResponse> doOpen(
+      String url, {
+      required bool followRedirects,
+    }) async {
+      final upstreamClient = _getUpstreamClient();
+      final req = await upstreamClient.openUrl(method, Uri.parse(url));
+      req.followRedirects = followRedirects;
+      if (rangeHeader != null && rangeHeader.isNotEmpty) {
+        req.headers.set(HttpHeaders.rangeHeader, rangeHeader);
+      }
+      return req.close();
+    }
+
+    if (!session.isDebridStream) {
+      await _ensureNativeStreamActive(session);
+      final res = await doOpen(session.nativeStreamUrl, followRedirects: false);
+      if (res.statusCode >= 400) {
+        await res.drain<void>().catchError((_) {});
+        throw HttpException('Torrent engine returned HTTP ${res.statusCode}');
+      }
+      return res;
+    }
+
+    String? url = session.debridDirectUrl;
+    Object? lastErr;
+
+    if (url != null && url.isNotEmpty) {
+      try {
+        final res = await doOpen(url, followRedirects: true);
+        if (res.statusCode < 400) {
+          return res;
+        }
+        await res.drain<void>().catchError((_) {});
+        lastErr = 'HTTP ${res.statusCode}';
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    // Direct URL missing or expired: try re-resolving once through Debrid
+    final settings = ServerSettingsService.instance;
+    if (settings.hasConfiguredDebrid) {
+      try {
+        final resolved = await debridService.resolveAudioFile(
+          provider: settings.debridProvider,
+          apiKey: settings.activeDebridApiKey,
+          magnetOrInfoHash: session.magnetUri,
+          filePath: session.filePath,
+          fileIndex: session.fileIndex,
+        );
+        session.debridDirectUrl = resolved.directUrl;
+        if (session.fileSize <= 0 && resolved.fileSize > 0) {
+          session.fileSize = resolved.fileSize;
+        }
+        final retryRes = await doOpen(
+          resolved.directUrl,
+          followRedirects: true,
+        );
+        if (retryRes.statusCode < 400) {
+          return retryRes;
+        }
+        await retryRes.drain<void>().catchError((_) {});
+        lastErr = 'HTTP ${retryRes.statusCode}';
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+
+    // If fallback to P2P torrent is enabled, switch this session to libtorrent
+    if (settings.fallbackToTorrentOnDebridFailure) {
+      _log(
+        'Debrid upstream unreachable ($lastErr); falling back to P2P torrent...',
+      );
+      session.isDebridStream = false;
+      await _ensureNativeStreamActive(session);
+      final fallbackRes = await doOpen(
+        session.nativeStreamUrl,
+        followRedirects: false,
+      );
+      if (fallbackRes.statusCode >= 400) {
+        await fallbackRes.drain<void>().catchError((_) {});
+        throw HttpException(
+          'Torrent fallback returned HTTP ${fallbackRes.statusCode}',
+        );
+      }
+      return fallbackRes;
+    }
+
+    final provider = DebridProvider.fromId(session.debridProvider);
+    final errMsg =
+        'Debrid stream unreachable: ${lastErr ?? "unknown error"}. Enable "Try Torrenting if Debrid Fails" in Settings to fall back to P2P torrenting.';
+    throw DebridException(
+      errMsg,
+      provider: provider.isConfiguredProvider ? provider : null,
+    );
+  }
+
   static int _resolveUpstreamStartOffset(
     HttpClientResponse upstreamRes, {
     required int fallbackStart,
   }) {
     final cr = upstreamRes.headers.value(HttpHeaders.contentRangeHeader);
     if (cr != null) {
-      final m = RegExp(r'bytes\s+(\d+)-(\d+)/(\d+|\*)', caseSensitive: false)
-          .firstMatch(cr);
+      final m = RegExp(
+        r'bytes\s+(\d+)-(\d+)/(\d+|\*)',
+        caseSensitive: false,
+      ).firstMatch(cr);
       if (m != null) {
         final parsed = int.tryParse(m.group(1) ?? '');
         if (parsed != null && parsed >= 0) return parsed;
@@ -1338,14 +1664,13 @@ class HttpStreamingServer extends ChangeNotifier {
     return fallbackStart;
   }
 
-  static _RangeParseResult? _parseRangeHeader(String? rangeHeader, int fileSize) {
+  static _RangeParseResult? _parseRangeHeader(
+    String? rangeHeader,
+    int fileSize,
+  ) {
     if (fileSize <= 0) return null;
     if (rangeHeader == null || rangeHeader.trim().isEmpty) {
-      return _RangeParseResult(
-        start: 0,
-        end: fileSize - 1,
-        isPartial: false,
-      );
+      return _RangeParseResult(start: 0, end: fileSize - 1, isPartial: false);
     }
 
     final trimmed = rangeHeader.trim();
@@ -1397,11 +1722,7 @@ class HttpStreamingServer extends ChangeNotifier {
       end = math.min(parsedEnd, fileSize - 1);
     }
 
-    return _RangeParseResult(
-      start: start,
-      end: end,
-      isPartial: true,
-    );
+    return _RangeParseResult(start: start, end: end, isPartial: true);
   }
 
   /// Converts suffix ranges like `bytes=-500` into explicit `bytes=start-end`
@@ -1447,4 +1768,3 @@ class _RangeParseResult {
     this.unsatisfiable = false,
   });
 }
-

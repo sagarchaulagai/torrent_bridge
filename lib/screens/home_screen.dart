@@ -3,8 +3,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:libtorrent_flutter/libtorrent_flutter.dart';
 
+import '../models/debrid_models.dart';
 import '../models/streaming_models.dart';
 import '../services/android_foreground_service.dart';
+import '../services/debrid_service.dart';
 import '../services/http_streaming_server.dart';
 import '../services/server_settings_service.dart';
 import '../services/torrent_engine_service.dart';
@@ -12,7 +14,9 @@ import '../services/torrent_engine_service.dart';
 const String kDefaultTestInfoHash = '2a72c612335bd7cc5221b9c20838a9a349cf3821';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  final DebridService? debridService;
+
+  const HomeScreen({super.key, this.debridService});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -167,7 +171,9 @@ class _HomeScreenState extends State<HomeScreen>
 
   void _showSnack(String msg, {bool error = false}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
       SnackBar(
         content: Text(msg),
         behavior: SnackBarBehavior.floating,
@@ -280,6 +286,7 @@ class _HomeScreenState extends State<HomeScreen>
           ),
           _SettingsTab(
             settings: _settings,
+            debridService: widget.debridService ?? DebridService.instance,
             portCtrl: _portCtrl,
             serverRunning: _server.isRunning,
             activeServerPort: _server.port,
@@ -292,6 +299,7 @@ class _HomeScreenState extends State<HomeScreen>
               await _settings.refreshCacheUsage();
               _showSnack('Cache usage: ${_settings.cachedBytesFormatted}');
             },
+            onShowMessage: _showSnack,
           ),
         ],
       ),
@@ -1415,21 +1423,25 @@ class _FileCard extends StatelessWidget {
 
 class _SettingsTab extends StatelessWidget {
   final ServerSettingsService settings;
+  final DebridService debridService;
   final TextEditingController portCtrl;
   final bool serverRunning;
   final int activeServerPort;
   final Future<void> Function() onRestartServer;
   final VoidCallback onClearCache;
   final VoidCallback onRefreshCache;
+  final void Function(String message) onShowMessage;
 
   const _SettingsTab({
     required this.settings,
+    required this.debridService,
     required this.portCtrl,
     required this.serverRunning,
     required this.activeServerPort,
     required this.onRestartServer,
     required this.onClearCache,
     required this.onRefreshCache,
+    required this.onShowMessage,
   });
 
   @override
@@ -1448,6 +1460,15 @@ class _SettingsTab extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        // ── 0. Debrid Service Integration ───────────────────────────────────
+        _DebridSettingsCard(
+          settings: settings,
+          debridService: debridService,
+          onShowMessage: onShowMessage,
+        ),
+
+        const SizedBox(height: 16),
+
         // ── 1. Priority Section (Mero Audiobook Mode) ────────────────────────
         _SettingsCard(
           icon: Icons.bolt_rounded,
@@ -1759,6 +1780,348 @@ class _SettingsTab extends StatelessWidget {
 
         const SizedBox(height: 24),
       ],
+    );
+  }
+}
+
+class _DebridSettingsCard extends StatefulWidget {
+  final ServerSettingsService settings;
+  final DebridService debridService;
+  final void Function(String message) onShowMessage;
+
+  const _DebridSettingsCard({
+    required this.settings,
+    required this.debridService,
+    required this.onShowMessage,
+  });
+
+  @override
+  State<_DebridSettingsCard> createState() => _DebridSettingsCardState();
+}
+
+class _DebridSettingsCardState extends State<_DebridSettingsCard> {
+  late final TextEditingController _apiKeyCtrl;
+  late DebridProvider _loadedProvider;
+  bool _obscureKey = true;
+  bool _isValidating = false;
+  DebridValidationResult? _validationResult;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadedProvider = widget.settings.debridProvider;
+    _apiKeyCtrl = TextEditingController(
+      text: widget.settings.debridApiKeyFor(_loadedProvider),
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant _DebridSettingsCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.settings.debridProvider != _loadedProvider) {
+      _syncControllerForProvider(widget.settings.debridProvider);
+    }
+  }
+
+  void _syncControllerForProvider(DebridProvider provider) {
+    _loadedProvider = provider;
+    _apiKeyCtrl.text = widget.settings.debridApiKeyFor(provider);
+    _validationResult = null;
+  }
+
+  @override
+  void dispose() {
+    _apiKeyCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _validateAndSaveKey() async {
+    final provider = widget.settings.debridProvider;
+    if (provider == DebridProvider.none) return;
+
+    final rawKey = _apiKeyCtrl.text.trim();
+    if (rawKey.isEmpty) {
+      await widget.settings.clearDebridApiKey(provider);
+      setState(() {
+        _validationResult = DebridValidationResult(
+          provider: provider,
+          isValid: false,
+          message: 'Please enter an API key.',
+        );
+      });
+      return;
+    }
+
+    setState(() {
+      _isValidating = true;
+      _validationResult = null;
+    });
+
+    try {
+      final result =
+          await widget.debridService.validateApiKey(provider, rawKey);
+      if (mounted) {
+        setState(() {
+          _validationResult = result;
+        });
+      }
+      await widget.settings.setDebridApiKey(
+        provider,
+        rawKey,
+        validated: result.isValid,
+        accountLabel: result.username,
+      );
+
+      if (!mounted) return;
+      widget.onShowMessage(
+        result.isValid
+            ? '${provider.displayName} API key verified!'
+            : '${provider.displayName}: ${result.message}',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isValidating = false);
+      }
+    }
+  }
+
+  Future<void> _clearKey() async {
+    final provider = widget.settings.debridProvider;
+    _apiKeyCtrl.clear();
+    setState(() {
+      _validationResult = null;
+    });
+    await widget.settings.clearDebridApiKey(provider);
+    if (mounted) {
+      widget.onShowMessage('${provider.displayName} API key cleared.');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final provider = widget.settings.debridProvider;
+    final savedKey = widget.settings.debridApiKeyFor(provider);
+    final isValidatedSaved = widget.settings.isDebridKeyValidatedFor(provider);
+    final savedAccount = widget.settings.debridAccountLabelFor(provider);
+    final hasUnsavedEdits = _apiKeyCtrl.text.trim() != savedKey.trim();
+
+    return _SettingsCard(
+      icon: Icons.cloud_sync_rounded,
+      iconColor: cs.primary,
+      title: 'Debrid Service',
+      subtitle:
+          'Stream audiobooks through a Debrid cloud provider using your API key.',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          DropdownButtonFormField<DebridProvider>(
+            key: const Key('debrid_provider_dropdown'),
+            initialValue: provider,
+            decoration: const InputDecoration(
+              labelText: 'Debrid Provider',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            items: DebridProvider.selectableProviders
+                .map(
+                  (p) => DropdownMenuItem<DebridProvider>(
+                    value: p,
+                    child: Text(p.displayName),
+                  ),
+                )
+                .toList(),
+            onChanged: _isValidating
+                ? null
+                : (selected) async {
+                    if (selected == null) return;
+                    await widget.settings.setDebridProvider(selected);
+                    if (mounted) {
+                      setState(() {
+                        _syncControllerForProvider(selected);
+                      });
+                    }
+                  },
+          ),
+          if (provider.isConfiguredProvider) ...[
+            const SizedBox(height: 12),
+            TextField(
+              key: const Key('debrid_api_key_field'),
+              controller: _apiKeyCtrl,
+              obscureText: _obscureKey,
+              onChanged: (_) => setState(() {
+                _validationResult = null;
+              }),
+              onSubmitted: (_) => _validateAndSaveKey(),
+              decoration: InputDecoration(
+                labelText: '${provider.displayName} API Key',
+                hintText: 'Paste API key (${provider.keyPortalHint})',
+                border: const OutlineInputBorder(),
+                isDense: true,
+                suffixIcon: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: _obscureKey ? 'Show API key' : 'Hide API key',
+                      icon: Icon(
+                        _obscureKey
+                            ? Icons.visibility_rounded
+                            : Icons.visibility_off_rounded,
+                        size: 18,
+                      ),
+                      onPressed: () {
+                        setState(() => _obscureKey = !_obscureKey);
+                      },
+                    ),
+                    if (_apiKeyCtrl.text.isNotEmpty)
+                      IconButton(
+                        tooltip: 'Remove key',
+                        icon: const Icon(Icons.close_rounded, size: 18),
+                        onPressed: _isValidating ? null : _clearKey,
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    key: const Key('debrid_validate_save_button'),
+                    onPressed: _isValidating ? null : _validateAndSaveKey,
+                    icon: _isValidating
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.verified_user_rounded, size: 18),
+                    label: Text(
+                      _isValidating ? 'Validating...' : 'Validate & Save Key',
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            _buildStatusBadge(
+              cs: cs,
+              provider: provider,
+              savedKey: savedKey,
+              isValidatedSaved: isValidatedSaved,
+              savedAccount: savedAccount,
+              hasUnsavedEdits: hasUnsavedEdits,
+            ),
+          ],
+          const Divider(height: 22),
+          SwitchListTile.adaptive(
+            key: const Key('debrid_fallback_switch'),
+            contentPadding: EdgeInsets.zero,
+            title: const Text(
+              'Try Torrenting if Debrid Fails',
+              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+            ),
+            subtitle: Text(
+              'Default is OFF. When OFF and Debrid fails or is still unavailable, an error message is shown instead of falling back to P2P torrenting.',
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            ),
+            value: widget.settings.fallbackToTorrentOnDebridFailure,
+            onChanged: (v) =>
+                widget.settings.setFallbackToTorrentOnDebridFailure(v),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusBadge({
+    required ColorScheme cs,
+    required DebridProvider provider,
+    required String savedKey,
+    required bool isValidatedSaved,
+    required String? savedAccount,
+    required bool hasUnsavedEdits,
+  }) {
+    if (hasUnsavedEdits && _validationResult == null) {
+      return Text(
+        'Unsaved changes — tap "Validate & Save Key" to verify.',
+        style: TextStyle(fontSize: 11, color: cs.primary),
+      );
+    }
+
+    final liveResult = _validationResult;
+    if (liveResult != null && liveResult.provider == provider) {
+      return _ValidationBanner(
+        isValid: liveResult.isValid,
+        message: liveResult.message,
+      );
+    }
+
+    if (savedKey.isNotEmpty) {
+      if (isValidatedSaved) {
+        final acct =
+            savedAccount != null && savedAccount.isNotEmpty ? ' ($savedAccount)' : '';
+        return _ValidationBanner(
+          isValid: true,
+          message: '${provider.displayName} API key is valid$acct.',
+        );
+      }
+      return _ValidationBanner(
+        isValid: false,
+        message:
+            'Saved ${provider.displayName} key is not verified or failed validation.',
+      );
+    }
+
+    return Text(
+      'Enter your ${provider.displayName} API key and tap Validate & Save Key.',
+      style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+    );
+  }
+}
+
+class _ValidationBanner extends StatelessWidget {
+  final bool isValid;
+  final String message;
+
+  const _ValidationBanner({
+    required this.isValid,
+    required this.message,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = isValid ? Colors.greenAccent : Colors.redAccent;
+    return Container(
+      key: Key(isValid ? 'debrid_valid_badge' : 'debrid_invalid_badge'),
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.45)),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isValid ? Icons.check_circle_rounded : Icons.error_outline_rounded,
+            color: color,
+            size: 16,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: TextStyle(
+                fontSize: 12,
+                color: color,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

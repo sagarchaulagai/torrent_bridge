@@ -35,10 +35,15 @@ void main() {
     await tester.tap(find.text('Settings'));
     await tester.pumpAndSettle();
 
+    expect(find.text('Debrid Service'), findsOneWidget);
     expect(find.text('Intelligent Stream Priority'), findsOneWidget);
+
+    await tester.scrollUntilVisible(
+      find.text('Audio & Torrent Cache'),
+      300,
+      scrollable: find.byType(Scrollable).last,
+    );
     expect(find.text('Audio & Torrent Cache'), findsOneWidget);
-    expect(find.text('Prioritize Newest Torrent'), findsOneWidget);
-    expect(find.text('Auto-Pause Background Torrents'), findsOneWidget);
     expect(find.text('2 GB (Default)'), findsOneWidget);
 
     await tester.scrollUntilVisible(

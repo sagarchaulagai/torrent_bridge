@@ -349,6 +349,19 @@ class TorrentEngineService extends ChangeNotifier {
         'No files available for torrent $torrentId (metadata not yet loaded).',
       );
     }
+    return selectAudioFile(files, filePath: filePath, fileIndex: fileIndex);
+  }
+
+  /// Selects a matching [AudioFileEntry] from [files] by [fileIndex], [filePath],
+  /// or default first audio / streamable file.
+  static AudioFileEntry selectAudioFile(
+    List<AudioFileEntry> files, {
+    String? filePath,
+    int? fileIndex,
+  }) {
+    if (files.isEmpty) {
+      throw StateError('No files available to select from.');
+    }
 
     if (fileIndex != null && fileIndex >= 0) {
       final byIdx = files.where((f) => f.index == fileIndex).firstOrNull;

@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:libtorrent_flutter/libtorrent_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../models/debrid_models.dart';
 import 'audio_disk_cache_service.dart';
 
 /// Manages server preferences, disk cache quota (default 2 GB),
@@ -28,6 +29,12 @@ class ServerSettingsService extends ChangeNotifier {
   bool _cacheDefault2GbMigrated = true;
   int _serverPort = 8080;
 
+  DebridProvider _debridProvider = DebridProvider.none;
+  final Map<String, String> _debridApiKeys = {};
+  final Map<String, bool> _debridKeyValidated = {};
+  final Map<String, String> _debridAccountLabels = {};
+  bool _fallbackToTorrentOnDebridFailure = false;
+
   int _cachedBytes = 0;
   bool _isCalculatingCache = false;
   bool _isEnforcingCache = false;
@@ -48,6 +55,24 @@ class ServerSettingsService extends ChangeNotifier {
   bool get autoStartServer => _autoStartServer;
   bool get keepServerRunning => _keepServerRunning;
   int get serverPort => _serverPort;
+
+  DebridProvider get debridProvider => _debridProvider;
+  String get activeDebridApiKey =>
+      _debridApiKeys[_debridProvider.id]?.trim() ?? '';
+  String debridApiKeyFor(DebridProvider provider) =>
+      _debridApiKeys[provider.id] ?? '';
+  bool get isActiveDebridKeyValidated =>
+      _debridKeyValidated[_debridProvider.id] ?? false;
+  bool isDebridKeyValidatedFor(DebridProvider provider) =>
+      _debridKeyValidated[provider.id] ?? false;
+  String? debridAccountLabelFor(DebridProvider provider) =>
+      _debridAccountLabels[provider.id];
+  String? get activeDebridAccountLabel =>
+      _debridAccountLabels[_debridProvider.id];
+  bool get hasConfiguredDebrid =>
+      _debridProvider.isConfiguredProvider && activeDebridApiKey.isNotEmpty;
+  bool get fallbackToTorrentOnDebridFailure =>
+      _fallbackToTorrentOnDebridFailure;
 
   int get cachedBytes => _cachedBytes;
   bool get isCalculatingCache => _isCalculatingCache;
@@ -112,6 +137,37 @@ class ServerSettingsService extends ChangeNotifier {
         _autoStartServer = json['auto_start_server'] as bool? ?? false;
         _keepServerRunning = json['keep_server_running'] as bool? ?? false;
         _serverPort = (json['server_port'] as num?)?.toInt() ?? 8080;
+        _debridProvider =
+            DebridProvider.fromId(json['debrid_provider']?.toString());
+        _fallbackToTorrentOnDebridFailure =
+            json['fallback_to_torrent_on_debrid_failure'] as bool? ?? false;
+
+        _debridApiKeys.clear();
+        if (json['debrid_api_keys'] is Map) {
+          for (final e in (json['debrid_api_keys'] as Map).entries) {
+            final k = e.key.toString();
+            final v = e.value?.toString().trim() ?? '';
+            if (v.isNotEmpty) {
+              _debridApiKeys[k] = v;
+            }
+          }
+        }
+        _debridKeyValidated.clear();
+        if (json['debrid_key_validated'] is Map) {
+          for (final e in (json['debrid_key_validated'] as Map).entries) {
+            _debridKeyValidated[e.key.toString()] = e.value == true;
+          }
+        }
+        _debridAccountLabels.clear();
+        if (json['debrid_account_labels'] is Map) {
+          for (final e in (json['debrid_account_labels'] as Map).entries) {
+            final v = e.value?.toString().trim() ?? '';
+            if (v.isNotEmpty) {
+              _debridAccountLabels[e.key.toString()] = v;
+            }
+          }
+        }
+
         _cacheDefault2GbMigrated =
             json['cache_default_2gb_migrated'] as bool? ?? false;
 
@@ -161,10 +217,22 @@ class ServerSettingsService extends ChangeNotifier {
         'auto_start_server': _autoStartServer,
         'keep_server_running': _keepServerRunning,
         'server_port': _serverPort,
+        'debrid_provider': _debridProvider.id,
+        'debrid_api_keys': _debridApiKeys,
+        'debrid_key_validated': _debridKeyValidated,
+        'debrid_account_labels': _debridAccountLabels,
+        'fallback_to_torrent_on_debrid_failure':
+            _fallbackToTorrentOnDebridFailure,
         'last_accessed': _lastAccessedMap,
         'root_names': _infoHashToRootName,
       };
-      await file.writeAsString(jsonEncode(json));
+      final tmpFile = File(
+        '${file.path}.${DateTime.now().microsecondsSinceEpoch}.tmp',
+      );
+      await tmpFile.writeAsString(jsonEncode(json), flush: true);
+      if (await tmpFile.exists()) {
+        await tmpFile.rename(file.path);
+      }
     } catch (e) {
       debugPrint('Error saving settings file: $e');
     }
@@ -226,6 +294,59 @@ class ServerSettingsService extends ChangeNotifier {
       notifyListeners();
       await _saveSettingsFile();
     }
+  }
+
+  Future<void> setDebridProvider(DebridProvider provider) async {
+    if (_debridProvider == provider) return;
+    _debridProvider = provider;
+    notifyListeners();
+    await _saveSettingsFile();
+  }
+
+  Future<void> setDebridApiKey(
+    DebridProvider provider,
+    String apiKey, {
+    bool validated = false,
+    String? accountLabel,
+  }) async {
+    final trimmed = apiKey.trim();
+    if (trimmed.isEmpty) {
+      _debridApiKeys.remove(provider.id);
+      _debridKeyValidated.remove(provider.id);
+      _debridAccountLabels.remove(provider.id);
+    } else {
+      _debridApiKeys[provider.id] = trimmed;
+      _debridKeyValidated[provider.id] = validated;
+      if (accountLabel != null && accountLabel.trim().isNotEmpty) {
+        _debridAccountLabels[provider.id] = accountLabel.trim();
+      } else if (!validated) {
+        _debridAccountLabels.remove(provider.id);
+      }
+    }
+    notifyListeners();
+    await _saveSettingsFile();
+  }
+
+  Future<void> clearDebridApiKey(DebridProvider provider) async {
+    _debridApiKeys.remove(provider.id);
+    _debridKeyValidated.remove(provider.id);
+    _debridAccountLabels.remove(provider.id);
+    notifyListeners();
+    await _saveSettingsFile();
+  }
+
+  Future<void> setFallbackToTorrentOnDebridFailure(bool value) async {
+    if (_fallbackToTorrentOnDebridFailure == value) return;
+    _fallbackToTorrentOnDebridFailure = value;
+    notifyListeners();
+    await _saveSettingsFile();
+  }
+
+  static String maskApiKey(String key) {
+    final trimmed = key.trim();
+    if (trimmed.isEmpty) return '';
+    if (trimmed.length <= 6) return '***';
+    return '${trimmed.substring(0, 3)}...${trimmed.substring(trimmed.length - 3)}';
   }
 
   // ─── LRU Cache Management ──────────────────────────────────────────────────
@@ -561,6 +682,14 @@ class ServerSettingsService extends ChangeNotifier {
         'auto_start_server': _autoStartServer,
         'keep_server_running': _keepServerRunning,
         'server_port': _serverPort,
+        'debrid_provider': _debridProvider.id,
+        'debrid_provider_name': _debridProvider.displayName,
+        'has_debrid_api_key': hasConfiguredDebrid,
+        'debrid_api_key_masked': maskApiKey(activeDebridApiKey),
+        'debrid_key_validated': isActiveDebridKeyValidated,
+        'debrid_account_label': activeDebridAccountLabel,
+        'fallback_to_torrent_on_debrid_failure':
+            _fallbackToTorrentOnDebridFailure,
         'cache_path': _cachePath,
         'disk_cache': AudioDiskCacheService.instance.toSummaryJson(),
       };

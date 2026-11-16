@@ -46,6 +46,33 @@ class AudioFileEntry {
     );
   }
 
+  factory AudioFileEntry.fromPathAndSize({
+    required int index,
+    required String path,
+    required int size,
+    bool? isStreamable,
+  }) {
+    final normalizedPath = path.replaceAll('\\', '/');
+    final effectiveName = normalizedPath.contains('/')
+        ? normalizedPath.split('/').last
+        : normalizedPath;
+    final ext = extractExtension(effectiveName);
+    final mime = mimeTypeForExtension(ext);
+    final isAudio = isAudioExtension(ext);
+
+    return AudioFileEntry(
+      index: index,
+      name: effectiveName,
+      path: normalizedPath,
+      size: size,
+      isStreamable: isStreamable ?? isAudio,
+      extension: ext,
+      mimeType: mime,
+      formatLabel: ext.isEmpty ? 'RAW' : ext.substring(1).toUpperCase(),
+      isAudioFile: isAudio,
+    );
+  }
+
   AudioFileEntry copyWith({int? size}) {
     return AudioFileEntry(
       index: index,
@@ -194,6 +221,10 @@ class StreamingSession {
   String nativeStreamUrl;
   final DateTime createdAt;
 
+  bool isDebridStream;
+  String? debridProvider;
+  String? debridDirectUrl;
+
   int activeClients;
   int totalRequests;
   int bytesServed;
@@ -220,6 +251,9 @@ class StreamingSession {
     required this.formatLabel,
     required this.nativeStreamUrl,
     required this.createdAt,
+    this.isDebridStream = false,
+    this.debridProvider,
+    this.debridDirectUrl,
     this.activeClients = 0,
     this.totalRequests = 0,
     this.bytesServed = 0,
@@ -258,6 +292,10 @@ class StreamingSession {
         'is_cached': isCached,
         'cached_bytes': cachedBytes,
         'cached_percentage': cachedPercentage,
+        'stream_source':
+            isDebridStream ? 'debrid' : (isCached ? 'disk_cache' : 'torrent'),
+        'is_debrid': isDebridStream,
+        'debrid_provider': debridProvider,
         'last_accessed': lastAccessedAt.toIso8601String(),
         'last_range': lastRangeHeader,
         'stream_state': latestNativeInfo?.streamState.name ?? 'buffering',

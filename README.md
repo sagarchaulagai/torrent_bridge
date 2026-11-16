@@ -1,35 +1,153 @@
-# Mero Torrent-to-HTTP Audio Streaming Server
+# Torrent Bridge
 
-A standalone Android companion application built with **Flutter**, **`libtorrent_flutter` (`^2.0.0`)**, and **`just_audio` (`^0.10.6`)** that operates as a local **Torrent-to-HTTP Audio Streaming Server** for Mero Audiobook and any compatible HTTP audio player.
+**Local Torrent-to-HTTP Audio Streaming Server for Android**
+
+Torrent Bridge exposes peer-to-peer BitTorrent and Debrid cloud audio streams over a local `dart:io` HTTP server with byte-range (`206 Partial Content`) support, piece-aware persistent caching, low-latency seek coordination, and background service resilience designed for sideloaded (non-Play Store) Android devices and companion players such as **Mero Audiobook**.
+
+| Stack | Runtime | Target Platform | Package ID |
+| --- | --- | --- | --- |
+| Flutter / Dart (`^3.13.5`) | `libtorrent_flutter` `1.7.8` | Android (API 24+) | `com.rehesagar.torrentbridge` |
 
 ---
 
-## Architecture & Core Modules
+## Core Capabilities
 
-- **[`lib/models/streaming_models.dart`](lib/models/streaming_models.dart)**: Data models for `AudioFileEntry`, `ConnectedClientInfo`, and `StreamingSession`.
-- **[`lib/services/torrent_engine_service.dart`](lib/services/torrent_engine_service.dart)**: Native `LibtorrentFlutter` engine wrapper handling initialization, magnet/infohash normalization, sparse stream-only torrent addition (`streamOnly: true`), reactive metadata resolution, file path/index matching, and native stream lifecycle.
-- **[`lib/services/http_streaming_server.dart`](lib/services/http_streaming_server.dart)**: Local HTTP server (`dart:io` `HttpServer`) exposing REST control endpoints and HTTP byte-range audio streaming endpoints with live client connection tracking and audio MIME header injection.
-- **[`lib/services/audio_player_service.dart`](lib/services/audio_player_service.dart)**: Built-in `just_audio` test player that connects to the local HTTP streaming server (`POST /api/stream` -> `GET /stream/<sessionId>`) to verify playback and byte-range seeking end-to-end.
-- **[`lib/services/android_foreground_service.dart`](lib/services/android_foreground_service.dart) & [`TorrentServerForegroundService.kt`](android/app/src/main/kotlin/com/example/torrent_streamer/TorrentServerForegroundService.kt)**: Native Android Foreground Service (`mediaPlayback|dataSync`) with persistent status notification, `Stop Server` notification action, CPU partial `WakeLock`, and low-latency `WifiLock`.
-- **[`lib/screens/home_screen.dart`](lib/screens/home_screen.dart)**: Material 3 interface containing the **Server Dashboard**, **Test Audio Player (`just_audio`)**, **Torrent Information & Audio Files**, and **Server Activity Log**.
-- **[`tool/test_streaming_server.py`](tool/test_streaming_server.py)**: Python 3.12 verification script testing server status, metadata inspection, stream creation, `HEAD` probing, and `206 Partial Content` HTTP Range seeking.
+| Area | Capabilities |
+| --- | --- |
+| **HTTP Streaming Server** | Exposes REST control endpoints and `GET` / `HEAD` / `OPTIONS` byte-range audio streaming (`Range: bytes=start-end`, `bytes=start-`, `bytes=-suffix`) with CORS headers, live client tracking, MIME inference, and optional token auth (`X-Auth-Token`, `Authorization: Bearer`, `?token=`). |
+| **Piece-Aware Disk Cache** | Tracks byte ranges alongside BitTorrent file-offset and `pieceLength` geometry inside atomic `<cachePath>/manifests/<infoHash>.manifest.json` files. Serves cached ranges directly from disk, inspects piece coverage, and stitches cached spans with uncached upstream windows. |
+| **Low-Latency Seeking** | Coordinates single-flight upstream fetches per session (`SessionStreamCoordinator`): aborts superseded `HttpClientRequest` sockets immediately on seek, debounces rapid scrubbing (`110 ms` uncached / `0 ms` cached), uses piece-aligned sliding windows, detects stalls (`12 s` P2P / `18 s` Debrid), and backpressures socket writes via `StreamIterator`. |
+| **Debrid Cloud Integration** | Validates keys and resolves direct CDN stream URLs across 6 providers (`AllDebrid`, `Debrid-Link`, `Offcloud`, `Premiumize`, `Real-Debrid`, `TorBox`), with configurable P2P fallback (`fallback_to_torrent_on_debrid_failure`, OFF by default). |
+| **Background Survival** | Separates the `FlutterEngine` from `MainActivity` via `TorrentBridgeEngineHost` and `TorrentBridgeApplication`, runs a `specialUse \| dataSync` foreground service with `WakeLock` + `WifiLock`, handles `BOOT_COMPLETED` / `MY_PACKAGE_REPLACED` / `onTaskRemoved` alarms, monitors network changes, and provides battery-exemption and OEM autostart helpers. |
+| **Sideload Self-Updater** | Checks GitHub `update.json`, verifies APK magic bytes while downloading, and invokes Android `FileProvider` package installation (`REQUEST_INSTALL_PACKAGES`). |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client["Audio Client / Mero Audiobook"] -->|"REST & HTTP Range"| Server["HttpStreamingServer (dart:io :8080)"]
+    Server --> Coord["SessionStreamCoordinator"]
+    Coord -->|"Cached Bytes (Read Lock)"| Cache["AudioDiskCacheService + TorrentManifest"]
+    Coord -->|"Missing Gaps (Piece-Aligned)"| Source{"Stream Source"}
+    Source -->|"Direct P2P"| Engine["TorrentEngineService (libtorrent_flutter)"]
+    Source -->|"Cloud CDN"| Debrid["DebridService (6 Providers)"]
+    Engine -->|"Write Lock + Pooled RAF"| Cache
+    Debrid -->|"Write Lock + Pooled RAF"| Cache
+
+    subgraph AndroidHost["Android Persistent Host (Non-UI Bound)"]
+        App["TorrentBridgeApplication"] --> Host["TorrentBridgeEngineHost (Shared FlutterEngine)"]
+        FGS["TorrentServerForegroundService (specialUse | dataSync)"] --> Host
+        Boot["BootCompletedReceiver"] --> FGS
+    end
+```
+
+### Project Layout
+
+```text
+torrent_bridge/
+|-- lib/
+|   |-- main.dart                                 # App entry point and headless autostart bootstrap
+|   |-- models/
+|   |   |-- debrid_models.dart                    # DebridProvider definitions and validation models
+|   |   `-- streaming_models.dart                 # AudioFileEntry, ConnectedClientInfo, StreamingSession
+|   |-- screens/
+|   |   `-- home_screen.dart                      # 3-tab UI: Server, Torrents, Settings & Cache
+|   `-- services/
+|       |-- android_foreground_service.dart       # MethodChannel bridge, BackgroundHealthStatus, OEM helpers
+|       |-- app_update_service.dart               # Sideloaded APK update checker and FileProvider installer
+|       |-- audio_disk_cache_service.dart         # Piece-aware disk cache, manifests, range locking & pooled I/O
+|       |-- debrid_service.dart                   # Provider API validation and direct link resolution
+|       |-- http_streaming_server.dart            # HTTP control/streaming server, watchdog, hybrid stitcher
+|       |-- server_settings_service.dart          # Preferences, LRU quota enforcement, duplicate raw cleanup
+|       |-- stream_fetch_coordinator.dart         # Single-flight seek cancellation, read-ahead & stall recovery
+|       `-- torrent_engine_service.dart           # libtorrent_flutter wrapper, metadata & manifest sync
+|-- android/app/src/main/
+|   |-- AndroidManifest.xml                       # specialUse FGS, boot/package receivers, FileProvider
+|   `-- kotlin/com/rehesagar/torrentbridge/
+|       |-- BootCompletedReceiver.kt              # Restores server after reboot or APK replacement
+|       |-- MainActivity.kt                       # Attaches to shared engine without destroying on finish
+|       |-- TorrentBridgeApplication.kt           # Pre-warms shared engine when keep-running is active
+|       |-- TorrentBridgeEngineHost.kt            # Singleton FlutterEngine, OEM power intents & health checks
+|       `-- TorrentServerForegroundService.kt     # specialUse/dataSync FGS, WakeLock, WifiLock, NetCallback
+|-- test/
+|   |-- app_update_test.dart
+|   |-- debrid_test.dart
+|   |-- smart_cache_and_seek_test.dart
+|   `-- widget_test.dart
+`-- tool/
+    |-- generate_icons.py
+    `-- test_streaming_server.py                  # Python end-to-end HTTP Range verification client
+```
+
+---
+
+## Supported Formats & Providers
+
+### Audio Extensions & MIME Types
+
+| Extension | Content-Type | Format Label |
+| --- | --- | --- |
+| `.mp3` | `audio/mpeg` | `MP3` |
+| `.m4a`, `.m4b`, `.m4p` | `audio/mp4` | `M4A`, `M4B`, `M4P` |
+| `.aac` | `audio/aac` | `AAC` |
+| `.flac` | `audio/flac` | `FLAC` |
+| `.ogg`, `.oga` | `audio/ogg` | `OGG`, `OGA` |
+| `.opus` | `audio/opus` | `OPUS` |
+| `.wav` | `audio/wav` | `WAV` |
+| `.wma` | `audio/x-ms-wma` | `WMA` |
+| `.weba` | `audio/webm` | `WEBA` |
+| `.mp4` | `video/mp4` | `MP4` |
+
+### Debrid Providers
+
+Configured in the **Settings** tab or via `POST /api/settings`:
+
+- `alldebrid` (AllDebrid)
+- `debridlink` (Debrid-Link)
+- `offcloud` (Offcloud)
+- `premiumize` (Premiumize)
+- `realdebrid` (Real-Debrid)
+- `torbox` (TorBox)
+- `none` (Direct P2P Torrent)
 
 ---
 
 ## HTTP API Reference
 
-### 1. Create / Resolve Audio Stream (`POST /api/stream` or `POST /stream`)
+Default bind port is `8080`. All endpoints emit CORS headers (`Access-Control-Allow-Origin: *`). When an authentication token is configured, clients can pass it via `X-Auth-Token`, `Authorization: Bearer <token>`, or `?token=<token>`.
 
-**Request Body:**
+### Endpoint Summary
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/`, `/status`, `/api/status` | Server state, LAN/loopback IPs, connected clients, and active sessions |
+| `POST` | `/api/stream`, `/stream` | Resolve or reuse a streaming session and return session URLs + telemetry |
+| `GET`, `HEAD` | `/stream/<sessionId>/<fileName>` | Stream audio with `Accept-Ranges: bytes` and `206 Partial Content` |
+| `GET`, `HEAD` | `/audio?magnet=...&file_path=...` | Direct resolve-and-stream convenience endpoint (`infohash` / `file_index` also accepted) |
+| `POST` | `/api/torrent/inspect` | Resolve torrent metadata and file list without starting playback |
+| `GET` | `/api/sessions` | List active `StreamingSession` objects |
+| `DELETE` | `/api/stream/<sessionId>` | Stop and dispose a streaming session |
+| `GET`, `DELETE` | `/api/cache` | Refresh disk usage stats or clear cache (preserving active sessions) |
+| `DELETE` | `/api/cache/torrent/<infoHash>` | Delete cached files and manifest for a specific torrent |
+| `GET`, `POST` | `/api/settings` | Read or update cache limits, read-ahead buffer, priority flags, and Debrid settings |
+
+### Create Stream (`POST /api/stream`)
+
+**Request:**
+
 ```json
 {
   "magnet": "magnet:?xt=urn:btih:2a72c612335bd7cc5221b9c20838a9a349cf3821",
   "file_path": "Audiobook/Chapter 01.mp3"
 }
 ```
-*(Also accepts `"infohash"` instead of `"magnet"`, and `"file_index"` instead of `"file_path"`.)*
+
+> Also accepts `"infohash"` (or `"uri"`) instead of `"magnet"`, and `"file_index"` instead of `"file_path"`.
 
 **Response (`200 OK`):**
+
 ```json
 {
   "status": "ok",
@@ -37,7 +155,7 @@ A standalone Android companion application built with **Flutter**, **`libtorrent
   "torrent_id": 1,
   "native_stream_id": 1,
   "infohash": "2a72c612335bd7cc5221b9c20838a9a349cf3821",
-  "torrent_name": "...",
+  "torrent_name": "Example Audiobook",
   "file_index": 0,
   "file_name": "Chapter 01.mp3",
   "file_path": "Audiobook/Chapter 01.mp3",
@@ -45,17 +163,67 @@ A standalone Android companion application built with **Flutter**, **`libtorrent
   "mime_type": "audio/mpeg",
   "format": "MP3",
   "stream_url": "http://192.168.1.10:8080/stream/s1_1_0/Chapter%2001.mp3",
-  "loopback_stream_url": "http://127.0.0.1:8080/stream/s1_1_0/Chapter%2001.mp3"
+  "loopback_stream_url": "http://127.0.0.1:8080/stream/s1_1_0/Chapter%2001.mp3",
+  "stream_source": "torrent",
+  "is_cached": false,
+  "cached_bytes": 0,
+  "cached_percentage": 0.0
 }
 ```
 
-### 2. Stream Audio with HTTP Range Support (`GET /stream/<sessionId>/<fileName>`)
-- Supports `GET`, `HEAD`, and `OPTIONS`.
-- Supports `Range: bytes=start-end`, `Range: bytes=start-`, and suffix ranges `Range: bytes=-suffix` (`206 Partial Content`).
-- Also available directly via `GET /audio?magnet=<magnet_or_hash>&file_path=<relative_path>`.
+### Runtime Settings (`GET` / `POST /api/settings`)
 
-### 3. Inspect Torrent Metadata (`POST /api/torrent/inspect`)
-- Resolves torrent metadata and returns the complete file list with indices, paths, sizes, formats, and MIME types without starting a stream.
+Configurable fields accepted by `POST /api/settings`:
 
-### 4. Server Status (`GET /api/status`)
-- Returns server running status, IP addresses, port, connected clients, and active streaming sessions.
+| Key | Type | Notes |
+| --- | --- | --- |
+| `max_cache_size_bytes` / `max_cache_size_mb` | `int` | Clamped between `128 MB` and `16 GB` (default `2 GB`) |
+| `read_ahead_buffer_bytes` / `read_ahead_buffer_mb` | `int` | Clamped between `4 MB` and `64 MB` (default `16 MB`) |
+| `prioritize_newest` | `bool` | Boosts priority for the active/newest torrent stream |
+| `auto_pause_background` | `bool` | Pauses secondary background torrents when primary stream switches |
+| `fast_audio_preload` | `bool` | Enables cancellable head (`512 KB`) and tail (`256 KB`) warmup |
+| `debrid_provider` | `string` | One of `none`, `alldebrid`, `debridlink`, `offcloud`, `premiumize`, `realdebrid`, `torbox` |
+| `debrid_api_key` | `string` | API key for the selected `debrid_provider` |
+| `fallback_to_torrent_on_debrid_failure` | `bool` | Falls back to direct P2P when Debrid resolution fails (default `false`) |
+
+---
+
+## Caching, Seeking & Android Behavior
+
+- **Piece Geometry Inference**: On metadata resolution and stream start, `TorrentManifest` records each file's `offset` and `length` and infers the nearest power-of-two BitTorrent `pieceLength` from `StreamInfo.readaheadWindow` (`16 MB / readaheadWindow`). `DiskCacheEntry` maps any byte range `[start, end]` to `[startPiece, endPiece]` and computes missing gaps against stored byte intervals.
+- **Duplicate Raw File Pruning**: During LRU quota enforcement (`checkAndEnforceCacheLimit`), raw libtorrent folders belonging to torrents already 100% cached inside the piece-aware stream store are pruned before evicting unique cached entries. Manifest files (`manifests/*.manifest.json`) are excluded from raw cleanup.
+- **Fast-Path Resume**: When a session already has a persisted manifest or partial disk cache entry on P2P mode, `createOrGetStreamSession` creates the HTTP session immediately without blocking on live peer metadata, while native torrent activation runs asynchronously.
+- **Android OEM Recommendations**: Swiping the app from Recents keeps the foreground service and shared `FlutterEngine` alive. On devices with aggressive background killers (Xiaomi MIUI/HyperOS, Oppo/Realme, Vivo, OnePlus, Huawei, Samsung), open **Settings -> Background Survival (Non-Play Store)** to grant **Ignore Battery Optimizations**, **Unrestricted Data**, and OEM **Autostart**.
+
+---
+
+## Development, Testing & Verification
+
+### Prerequisites
+
+- Flutter SDK (`^3.13.5`) and Android SDK (`minSdk 24`)
+- Python 3.12 (optional, for the end-to-end HTTP verification script)
+
+### Commands
+
+```powershell
+# Install dependencies
+flutter pub get
+
+# Run static analysis
+flutter analyze
+
+# Run unit, HTTP seek/cache, Debrid, updater, and widget tests
+flutter test
+
+# Build debug Android APK
+flutter build apk --debug
+```
+
+### End-to-End HTTP Verification Script
+
+With the Android app running locally (or forwarded over ADB with `adb forward tcp:8080 tcp:8080`):
+
+```powershell
+py -3.12 tool/test_streaming_server.py --host 127.0.0.1 --port 8080
+```
